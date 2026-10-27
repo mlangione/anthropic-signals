@@ -31,7 +31,7 @@
       {"handle": "_catwu", "tier": "A", "group": "official", "always": true},
       {"handle": "sammcallister", "tier": "A", "group": "official", "always": true},
       {"handle": "btibor91", "tier": "B", "group": "tracker", "always": true},
-      {"handle": "testingcatalog", "tier": "B", "group": "tracker", "always": true},
+      {"handle": "testingcatalog", "tier": "B", "group": "tracker", "always": false},
       {"handle": "kimmonismus", "tier": "C", "group": "tracker", "always": false},
       {"handle": "apples_jimmy", "tier": "C", "group": "tracker", "always": false},
       {"handle": "legit_rumors", "tier": "C", "group": "tracker", "always": false},
