@@ -1,0 +1,97 @@
+{
+  "lab": "Anthropic",
+  "window_days": 7,
+  "digest_hours": 48,
+  "keywords": "\\b(anthropic|claude|amodei|mythos|opus|sonnet|haiku)\\b",
+  "x": {
+    "search_hours_utc": [6, 18],
+    "search_max_results": 50,
+    "searches": [
+      "Anthropic (leak OR rumor OR rumour OR \"coming soon\" OR launch OR release OR announce) -is:retweet lang:en",
+      "Claude (leak OR rumor OR \"coming soon\" OR \"new model\" OR launch OR release) -is:retweet lang:en",
+      "\"Claude Code\" (new OR update OR feature OR leak OR version) -is:retweet lang:en",
+      "Anthropic (IPO OR \"S-1\" OR valuation OR funding OR revenue OR \"run-rate\") -is:retweet lang:en"
+    ],
+    "accounts": [
+      {"handle": "AnthropicAI", "tier": "A", "group": "official", "always": true},
+      {"handle": "claudeai", "tier": "A", "group": "official", "always": true},
+      {"handle": "DarioAmodei", "tier": "A", "group": "official", "always": true},
+      {"handle": "jackclarkSF", "tier": "A", "group": "official", "always": true},
+      {"handle": "alexalbert__", "tier": "A", "group": "official", "always": true},
+      {"handle": "mikeyk", "tier": "A", "group": "official", "always": true},
+      {"handle": "AmandaAskell", "tier": "A", "group": "official", "always": true},
+      {"handle": "bcherny", "tier": "A", "group": "official", "always": true},
+      {"handle": "_catwu", "tier": "A", "group": "official", "always": true},
+      {"handle": "sammcallister", "tier": "A", "group": "official", "always": true},
+      {"handle": "btibor91", "tier": "B", "group": "tracker", "always": true},
+      {"handle": "testingcatalog", "tier": "B", "group": "tracker", "always": true},
+      {"handle": "kimmonismus", "tier": "C", "group": "tracker", "always": false},
+      {"handle": "apples_jimmy", "tier": "C", "group": "tracker", "always": false},
+      {"handle": "legit_rumors", "tier": "C", "group": "tracker", "always": false},
+      {"handle": "simonw", "tier": "B", "group": "analyst", "always": false},
+      {"handle": "swyx", "tier": "B", "group": "analyst", "always": false},
+      {"handle": "TheZvi", "tier": "B", "group": "analyst", "always": false},
+      {"handle": "emollick", "tier": "B", "group": "analyst", "always": false},
+      {"handle": "steph_palazzolo", "tier": "C", "group": "reporter", "always": false},
+      {"handle": "erinkwoo", "tier": "C", "group": "reporter", "always": false},
+      {"handle": "shiringhaffary", "tier": "C", "group": "reporter", "always": false},
+      {"handle": "alexeheath", "tier": "C", "group": "reporter", "always": false},
+      {"handle": "ReedAlbergotti", "tier": "C", "group": "reporter", "always": false},
+      {"handle": "kyliebytes", "tier": "C", "group": "reporter", "always": false}
+    ]
+  },
+  "reddit": {
+    "subreddits": [
+      {"name": "ClaudeAI", "filter": false},
+      {"name": "ClaudeCode", "filter": false},
+      {"name": "Anthropic", "filter": false},
+      {"name": "singularity", "filter": true},
+      {"name": "artificial", "filter": true},
+      {"name": "LocalLLaMA", "filter": true}
+    ],
+    "searches": ["anthropic", "claude"],
+    "min_score": 5
+  },
+  "hn": {
+    "queries": ["Anthropic", "Claude"],
+    "min_points": 3
+  },
+  "bluesky": {
+    "searches": ["Anthropic", "Claude Code", "Claude model"],
+    "accounts": ["simonwillison.net", "jackclark.bsky.social", "zvi.bsky.social"]
+  },
+  "rss": [
+    {"name": "Claude status (incidents)", "url": "https://status.claude.com/history.rss", "platform": "status", "tier": "A", "filter": false, "kind": "incident"},
+    {"name": "AWS What's New", "url": "https://aws.amazon.com/about-aws/whats-new/recent/feed/", "platform": "partner", "tier": "A", "filter": true, "kind": "release"},
+    {"name": "Google Cloud Vertex AI release notes", "url": "https://cloud.google.com/feeds/vertex-ai-release-notes.xml", "platform": "partner", "tier": "A", "filter": true, "kind": "release"},
+    {"name": "Import AI (Jack Clark)", "url": "https://importai.substack.com/feed", "platform": "substack", "tier": "B", "filter": false, "kind": "article"},
+    {"name": "Don't Worry About the Vase (Zvi)", "url": "https://thezvi.substack.com/feed", "platform": "substack", "tier": "B", "filter": false, "kind": "article"},
+    {"name": "Simon Willison", "url": "https://simonwillison.net/atom/everything/", "platform": "blog", "tier": "B", "filter": true, "kind": "article"},
+    {"name": "The Algorithmic Bridge", "url": "https://www.thealgorithmicbridge.com/feed", "platform": "substack", "tier": "B", "filter": true, "kind": "article"},
+    {"name": "Interconnects (Nathan Lambert)", "url": "https://www.interconnects.ai/feed", "platform": "substack", "tier": "B", "filter": true, "kind": "article"},
+    {"name": "Latent Space", "url": "https://www.latent.space/feed", "platform": "substack", "tier": "B", "filter": true, "kind": "article"},
+    {"name": "Platformer", "url": "https://www.platformer.news/rss/", "platform": "newsletter", "tier": "C", "filter": true, "kind": "article"},
+    {"name": "One Useful Thing (Mollick)", "url": "https://www.oneusefulthing.org/feed", "platform": "substack", "tier": "B", "filter": true, "kind": "article"},
+    {"name": "SemiAnalysis", "url": "https://newsletter.semianalysis.com/feed", "platform": "substack", "tier": "B", "filter": true, "kind": "article"},
+    {"name": "Stratechery", "url": "https://stratechery.com/feed/", "platform": "newsletter", "tier": "C", "filter": true, "kind": "article"}
+  ],
+  "pages": [
+    {"name": "Anthropic newsroom", "url": "https://www.anthropic.com/news", "link_prefix": "/news/", "platform": "anthropic.com", "tier": "A"},
+    {"name": "Anthropic engineering blog", "url": "https://www.anthropic.com/engineering", "link_prefix": "/engineering/", "platform": "anthropic.com", "tier": "A"},
+    {"name": "Anthropic research", "url": "https://www.anthropic.com/research", "link_prefix": "/research/", "platform": "anthropic.com", "tier": "A"}
+  ],
+  "watch_pages": [
+    {"name": "Claude docs release notes", "url": "https://docs.claude.com/en/release-notes/overview", "platform": "docs.claude.com", "tier": "A"},
+    {"name": "Claude Code CHANGELOG", "url": "https://raw.githubusercontent.com/anthropics/claude-code/main/CHANGELOG.md", "platform": "github", "tier": "A"},
+    {"name": "Claude pricing page", "url": "https://claude.com/pricing", "platform": "claude.com", "tier": "A"}
+  ],
+  "github_repos": ["anthropics/anthropic-sdk-python", "anthropics/anthropic-sdk-typescript", "anthropics/claude-code", "anthropics/claude-agent-sdk-python"],
+  "npm_packages": ["@anthropic-ai/claude-code", "@anthropic-ai/sdk"],
+  "appstore": {"app_id": "6473753684", "country": "us"},
+  "markets": {
+    "polymarket_regex": "anthropic|claude|amodei",
+    "polymarket_terms": ["anthropic", "claude"],
+    "polymarket_limit": 25,
+    "manifold_terms": ["Anthropic", "Claude"]
+  }
+}

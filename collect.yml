@@ -1,0 +1,48 @@
+name: collect-anthropic-signals
+
+on:
+  schedule:
+    - cron: "15 */6 * * *"      # 00:15, 06:15, 12:15, 18:15 UTC; X keyword searches run only in the 06 and 18 UTC runs (sources.json)
+  workflow_dispatch: {}
+
+permissions:
+  contents: write
+
+concurrency:
+  group: collect
+  cancel-in-progress: false
+
+jobs:
+  collect:
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Offline parser tests
+        run: python -I test_collect.py
+
+      - name: Collect
+        env:
+          X_BEARER_TOKEN: ${{ secrets.X_BEARER_TOKEN }}
+          REDDIT_CLIENT_ID: ${{ secrets.REDDIT_CLIENT_ID }}
+          REDDIT_CLIENT_SECRET: ${{ secrets.REDDIT_CLIENT_SECRET }}
+          REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
+          BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
+          BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GIST_ID: ${{ vars.GIST_ID }}
+          GIST_TOKEN: ${{ secrets.GIST_TOKEN }}
+        run: python -I collect.py --previous data/signals_raw.json --out data --max-seconds 1200
+
+      - name: Commit data
+        run: |
+          git config user.name "signals-collector"
+          git config user.email "signals-collector@users.noreply.github.com"
+          git add data/signals_raw.json data/signals_digest.json
+          git commit -m "collect $(date -u +%Y-%m-%dT%H:%MZ)" || echo "nothing to commit"
+          git push
