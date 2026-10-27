@@ -209,8 +209,274 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(x1["metrics_history"][0]["likes"], 10)
         cov = C.Coverage(); cov.ok("x", 1)
         dig = C.make_digest(merged, CFG, cov, {"x_reads_last_run": 3})
-        self.assertEqual([d["id"] for d in dig["items"]], ["x:1"])        # HN item has no keyword match
+        self.assertEqual([(d["by"], d["sid"]) for d in dig["items"]], [("btibor91", "1")])        # HN item has no keyword match
         self.assertEqual(dig["x_reads_last_run"], 3)
+        self.assertEqual(dig["schema"], "signals_digest/2")
+
+
+# ----------------------------------------------------------------------------- early detection, the size budget and the tripwires
+def mk(id_, plat, source, text, hours_ago=3, kind="post", **kw):
+    url = kw.pop("url", f"https://example.com/{id_}")
+    it = C.item(id_, plat, source, url, text, C.NOW - dt.timedelta(hours=hours_ago), kind, **kw)
+    it["first_seen"] = it["created_at"]
+    it["last_seen"] = it["created_at"]
+    it["metrics_history"] = []
+    return it
+
+
+OPENROUTER = {"data": [
+    {"id": "anthropic/claude-fable-9", "name": "Anthropic: Claude Fable 9", "created": int((C.NOW - dt.timedelta(days=1)).timestamp()), "context_length": 1000000,
+     "description": "A new frontier model.", "pricing": {"prompt": "0.000005", "completion": "0.000025"}},
+    {"id": "anthropic/claude-3-haiku", "name": "Anthropic: Claude 3 Haiku", "created": 1710000000, "pricing": {"prompt": "0.00000025", "completion": "0.00000125"}},
+    {"id": "openrouter/horizon-x", "name": "Horizon X", "created": int((C.NOW - dt.timedelta(hours=5)).timestamp()), "description": "Cloaked model provided to gather feedback."},
+    {"id": "openai/gpt-9", "name": "OpenAI: GPT-9", "created": int(C.NOW.timestamp()), "description": "Something else."}]}
+
+LITELLM1 = {"sample_spec": {"litellm_provider": "x"}, "gpt-4": {"litellm_provider": "openai"}, "claude-opus-4-5": {"litellm_provider": "anthropic", "max_input_tokens": 200000}}
+LITELLM2 = dict(LITELLM1, **{"claude-fable-9": {"litellm_provider": "anthropic", "max_input_tokens": 1000000, "input_cost_per_token": 5e-06, "output_cost_per_token": 2.5e-05},
+                             "anthropic.claude-fable-9-v1:0": {"litellm_provider": "bedrock"}})
+
+STATUSPAGE = {"components": [
+    {"id": "g1", "name": "Claude Code", "created_at": "2024-01-01T00:00:00Z", "group": True},
+    {"id": "c1", "name": "Claude Cowork", "created_at": RECENT, "group_id": "g1", "description": "Agentic desktop app"},
+    {"id": "c2", "name": "claude.ai", "created_at": "2024-01-01T00:00:00Z"}]}
+
+JOBS1 = {"jobs": [{"id": 1, "title": "Research Engineer", "location": {"name": "San Francisco, CA"}, "absolute_url": "https://jobs.example/1", "updated_at": RECENT}]}
+JOBS2 = {"jobs": JOBS1["jobs"] + [
+    {"id": 2, "title": "Head of Investor Relations", "location": {"name": "San Francisco, CA"}, "absolute_url": "https://jobs.example/2", "updated_at": RECENT},
+    {"id": 3, "title": "Account Executive", "location": {"name": "Tokyo, Japan | San Francisco, CA"}, "absolute_url": "https://jobs.example/3", "updated_at": RECENT},
+    {"id": 4, "title": "Software Engineer", "location": {"name": "San Francisco, CA"}, "absolute_url": "https://jobs.example/4", "updated_at": RECENT}]}
+
+SITEMAP_INDEX = '<?xml version="1.0"?><sitemapindex><sitemap><loc>https://site.example/sitemap-1.xml</loc></sitemap></sitemapindex>'
+SITEMAP_A = ('<urlset><url><loc>https://site.example/news/old-post</loc><lastmod>2026-01-01</lastmod></url>'
+             '<url><loc>https://site.example/careers/job-1</loc></url></urlset>')
+SITEMAP_B = SITEMAP_A.replace("</urlset>", '<url><loc>https://site.example/news/claude-fable-9-launch</loc><lastmod>2026-10-27</lastmod></url>'
+                                          '<url><loc>https://site.example/careers/job-2</loc></url></urlset>')
+
+
+class EarlyDetectionTests(unittest.TestCase):
+    def test_norm_id_makes_one_spelling_per_model(self):
+        for tok in ("claude-opus-4-5-20251101", "anthropic/claude-opus-4.5", "Opus 4.5", "us.anthropic.claude-opus-4-5-20251101-v1:0", "vertex_ai/claude-opus-4-5@20251101"):
+            self.assertEqual(C.norm_id(tok), "opus-4-5", tok)
+        self.assertEqual(C.norm_id("claude-3-5-sonnet-20241022"), "sonnet-3-5")
+        self.assertEqual(C.norm_id("claude-code"), "claude-code")
+        self.assertEqual(C.ids_in("Using claude-opus-4-5 and Claude Opus 4.5; Sonnet 5 is rumored; try claude_fable_9"), {"opus-4-5", "sonnet-5", "fable-9"})
+
+    def test_flags_vocabulary_novelty_and_corroboration(self):
+        old = mk("x:10", "x", "a", "Using claude-opus-4-5 for everything", hours_ago=96)
+        a = mk("x:11", "x", "leaker1", "Spotted claude-fable-9 in the model picker, rolling out soon", tier="D")
+        b = mk("x:12", "x", "leaker2", "claude-fable-9 shows up in the API too")
+        rt = mk("x:15", "x", "leaker3", "RT @leaker1: Spotted claude-fable-9 in the picker", kind="repost")
+        c = mk("x:13", "x", "someone", "Claude Opus 4.5 is great", hours_ago=2)
+        d = mk("x:14", "x", "someone", "Anthropic is launching something soon?")
+        state = {}
+        C.annotate_items([old, a, b, rt, c, d], state)
+        self.assertTrue({"leak", "id", "newid"} <= set(a["flags"]))
+        self.assertEqual(a["corr"], 2)                                  # two independent authors; the repost does not count
+        self.assertIn("newid", b["flags"])
+        self.assertIn("id", c["flags"])
+        self.assertNotIn("newid", c["flags"])                           # opus-4-5 was already mentioned four days ago
+        self.assertEqual(d["flags"], ["soon"])
+        self.assertIn("opus-4-5", state["seen_ids"])
+        self.assertNotIn("fable-9", state["seen_ids"])                  # first mentioned inside the window, so not yet "seen before"
+
+    def test_rising_engagement_flag(self):
+        hot = mk("x:20", "x", "someone", "Anthropic news", hours_ago=10, metrics={"likes": 100, "reposts": 10})
+        hot["metrics_history"] = [{"likes": 5, "reposts": 0, "at": C.iso(C.NOW - dt.timedelta(hours=6))}]
+        hot["last_seen"] = C.iso(C.NOW)
+        quiet = mk("x:21", "x", "someone", "Anthropic news two", hours_ago=10, metrics={"likes": 30})
+        quiet["metrics_history"] = [{"likes": 29, "at": C.iso(C.NOW - dt.timedelta(hours=6))}]
+        quiet["last_seen"] = C.iso(C.NOW)
+        C.annotate_items([hot, quiet], {})
+        self.assertIn("rising", hot["flags"])
+        self.assertNotIn("rising", quiet["flags"])
+
+    def test_priority_puts_early_signals_above_chatter(self):
+        leak = mk("x:30", "x", "lyraxana", "Spotted claude-fable-9 in the picker", tier="D", tags=["always"])
+        chatter = mk("x:31", "x", "user", "Claude is nice", tier="C", metrics={"likes": 12})
+        official = mk("x:32", "x", "claudeai", "Introducing something", tier="A", tags=["always"])
+        repost = mk("x:33", "x", "user", "RT @claudeai: Introducing something", kind="repost")
+        C.annotate_items([leak, chatter, official, repost], {})
+        order = sorted([leak, chatter, official, repost], key=C.priority, reverse=True)
+        self.assertEqual(order[0]["id"], "x:30")
+        self.assertEqual(order[-1]["id"], "x:33")
+        self.assertGreater(C.priority(official), C.priority(chatter))
+
+    def test_digest_fits_budget_keeps_early_signals_and_loses_nothing_silently(self):
+        items = [mk(f"x:{1000 + i}", "x", f"user{i % 40}", f"Claude thing number {i} " + "blah " * 60, hours_ago=1 + (i % 40), tier="C" if i % 3 else None, metrics={"likes": i % 17})
+                 for i in range(300)]
+        leak = mk("x:9999", "x", "lyraxana", "Spotted a new model id claude-fable-9 in the picker, rolling out soon", hours_ago=30, tier="D", tags=["always"])
+        official = mk("x:9998", "x", "claudeai", "Introducing something", hours_ago=2, tier="A", tags=["always"])
+        market = mk("pm:1", "polymarket", "Polymarket", "Will Anthropic IPO by Nov 20? - Yes 65%", hours_ago=100, kind="market", tier="market",
+                    extra={"probability": 0.65, "end_date": "2026-11-21T04:59:00Z"})
+        gh = mk("gh:1", "github", "anthropics/claude-code", "v2.1.0 release notes " + "x " * 200, hours_ago=20, tier="A", url="https://github.com/anthropics/claude-code/releases/tag/v2.1.0")
+        everything = items + [leak, official, market, gh]
+        for budget in (24000, 6000):
+            dig = C.make_digest([dict(i) for i in everything], dict(CFG, digest_budget_chars=budget), C.Coverage(), {})
+            text = C.dumps_digest(dig)
+            self.assertLessEqual(len(text), budget)
+            parsed = json.loads(text)                                   # plain valid JSON
+            self.assertIs(parsed["complete"], True)
+            self.assertTrue(text.rstrip().endswith('"complete":true\n}'.rstrip()))
+            self.assertEqual(parsed["n_items"], len(parsed["items"]))
+            self.assertEqual(parsed["items"][0]["sid"], "9999")           # the early signal ranks first
+            self.assertEqual(parsed["items"][0]["flags"][:1], ["leak"])
+            self.assertIn("9998", [i.get("sid") for i in parsed["items"]])
+            self.assertIn("polymarket", {i["plat"] for i in parsed["items"]})
+            self.assertEqual(parsed["overflow"]["n"] + parsed["n_items"], len(everything))        # every candidate is either in the digest or counted as overflow
+            self.assertEqual(len(dig["_more"]), parsed["overflow"]["n"])
+            self.assertEqual(parsed["budget"]["chars_limit"], budget)
+            more = json.loads(C.dumps_more(dig, CFG))
+            self.assertEqual(more["n_items"], len(more["items"]))
+            self.assertIs(more["complete"], True)
+
+    def test_compact_entries(self):
+        x = mk("x:40", "x", "lyraxana", "Spotted claude-fable-9", tier="D", metrics={"likes": 5, "reposts": 0, "views": 9000, "followers": 1200})
+        mkt = mk("pm:2", "polymarket", "Polymarket", "Will Anthropic IPO? - Yes 65%", kind="market", tier="market", extra={"probability": 0.6501, "end_date": "2026-11-21T04:59:00Z"})
+        rss = mk("rss:1", "substack", "Zvi", "Big headline\nBody text that follows the headline.", kind="article", title="Big headline", tier="B")
+        watch = mk("watch:1", "docs.claude.com", "Docs", "Docs changed. New text: a | b", kind="changelog", tier="A", tags=["tripwire"], extra={"new_lines": ["claude-fable-9 is available", "b"]})
+        C.annotate_items([x, mkt, rss, watch], {})
+        cx = C.compact(x, 100)
+        self.assertEqual((cx["plat"], cx["by"], cx["sid"], cx["fol"], cx["tier"]), ("x", "lyraxana", "40", 1200, "D"))
+        self.assertNotIn("url", cx)
+        self.assertEqual(cx["metrics"], {"likes": 5})                    # zero and views dropped
+        self.assertRegex(cx["at"], r"^\d{4}-\d\d-\d\dT\d\d:\d\dZ$")
+        cm = C.compact(mkt, 100)
+        self.assertEqual((cm["prob"], cm["end"], cm["kind"]), (0.65, "2026-11-21", "market"))
+        mf = mk("mf:1", "manifold", "Manifold", "Will Anthropic IPO? - Nov 2026 55%", kind="market", tier="market", extra={"answers": [], "close_time": 1798675140000})
+        self.assertEqual(C.compact(mf, 100)["end"], "2026-12-30")                       # epoch milliseconds become a date
+        self.assertEqual(C.compact(rss, 100)["text"], "Big headline. Body text that follows the headline.")
+        self.assertEqual(C.compact(rss, 100)["src"], "Zvi")
+        cw = C.compact(watch, 100)
+        self.assertEqual(cw["new_lines"][0], "claude-fable-9 is available")
+        self.assertIn("trip", cw["flags"])
+
+    def test_ranking_failure_falls_back_to_a_plain_digest(self):
+        items = [mk(f"x:{500 + i}", "x", "someone", f"Claude news {i}", hours_ago=i + 1) for i in range(5)]
+        cov = C.Coverage()
+        with mock.patch.object(C, "annotate_items", side_effect=RuntimeError("boom")):
+            dig = C.make_digest_safely(items, CFG, cov, {})
+        parsed = json.loads(C.dumps_digest(dig))
+        self.assertEqual(parsed["n_items"], 5)
+        self.assertEqual(parsed["items"][0]["text"], "Claude news 0")                  # newest first
+        self.assertIs(parsed["complete"], True)
+        self.assertEqual(cov.rows["digest"]["status"], "error")
+        self.assertEqual(json.loads(C.dumps_more(dig, CFG))["n_items"], 0)
+
+    def test_trim_keeps_word_boundaries(self):
+        self.assertEqual(C.trim("short", 50), "short")
+        t = C.trim("alpha beta gamma delta epsilon zeta eta theta", 25)
+        self.assertLessEqual(len(t), 25)
+        self.assertTrue(t.endswith("…"))
+        self.assertNotIn("gamm…", t)
+
+    def test_x_searches_accept_per_query_limits(self):
+        cfg = dict(CFG, x=dict(CFG["x"], accounts=[], searches=[{"query": "claude-opus", "max_results": 30}, "Anthropic leak"], search_hours_utc=[]))
+        calls = []
+
+        def _get(url, headers=None):
+            calls.append(url)
+            return {"data": [], "meta": {}}
+        with mock.patch.object(C, "get_json", side_effect=_get):
+            C.collect_x(cfg, {"x_user_ids": {}}, C.Coverage(), "tok", SINCE)
+        search_calls = [u for u in calls if "search/recent" in u]
+        self.assertIn("max_results=30", search_calls[0])
+        self.assertIn("max_results=50", search_calls[1])
+
+    def test_rss_fallback_url_is_used_when_primary_is_blocked(self):
+        cfg = dict(CFG, rss=[{"name": "Import AI", "url": "https://blocked.example/feed", "fallbacks": ["https://mirror.example/feed"], "platform": "substack", "tier": "B",
+                              "filter": False, "kind": "article"}])
+        seen = []
+
+        def _http(url, **k):
+            seen.append(url)
+            return (403, "", {}) if "blocked" in url else (200, ATOM, {})
+        cov = C.Coverage()
+        with mock.patch.object(C, "http", side_effect=_http):
+            items = C.collect_rss(cfg, cov, SINCE)
+        self.assertEqual(seen, ["https://blocked.example/feed", "https://mirror.example/feed"])
+        self.assertEqual(cov.rows["feeds"]["status"], "ok")
+        self.assertGreaterEqual(len(items), 1)
+
+
+class TripwireTests(unittest.TestCase):
+    def test_registry_openrouter_and_litellm(self):
+        cfg = dict(CFG, registry={"openrouter": {"regex": "anthropic|claude|cloaked|stealth"}, "litellm": {"regex": "claude|anthropic"}})
+        state, cov = {}, C.Coverage()
+        with mock.patch.object(C, "get_json", side_effect=fake_get_json({"openrouter.ai": OPENROUTER, "litellm": LITELLM1})):
+            first = C.collect_registry(cfg, state, cov, SINCE)
+        ids = sorted(i["id"] for i in first)
+        self.assertEqual(ids, ["or:anthropic/claude-fable-9", "or:openrouter/horizon-x"])        # old haiku and the unrelated OpenAI model are skipped; LiteLLM is a baseline
+        fable = next(i for i in first if i["id"].endswith("fable-9"))
+        self.assertIn("$5/M", fable["text"])
+        self.assertNotIn("provider not named", fable["text"])
+        self.assertIn("provider not named", next(i for i in first if i["id"].endswith("horizon-x"))["text"])
+        self.assertEqual(fable["platform"], "registry")
+        self.assertIn("tripwire", fable["tags"])
+        self.assertEqual(state["litellm_keys"], ["claude-opus-4-5"])
+        with mock.patch.object(C, "get_json", side_effect=fake_get_json({"openrouter.ai": {"data": []}, "litellm": LITELLM2})):
+            second = C.collect_registry(cfg, state, cov, SINCE)
+        self.assertEqual(sorted(i["title"] for i in second), ["anthropic.claude-fable-9-v1:0", "claude-fable-9"])
+        self.assertEqual(cov.rows["registry"]["status"], "ok")
+        self.assertIn("2 new", cov.rows["registry"]["note"])
+
+    def test_registry_reports_error_when_everything_fails(self):
+        cfg = dict(CFG, registry={"openrouter": {}, "litellm": {}})
+        cov = C.Coverage()
+        with mock.patch.object(C, "get_json", side_effect=RuntimeError("boom")):
+            self.assertEqual(C.collect_registry(cfg, {}, cov, SINCE), [])
+        self.assertEqual(cov.rows["registry"]["status"], "error")
+
+    def test_statuspage_components(self):
+        cfg = dict(CFG, statuspage={"name": "Claude status components", "components_url": "https://status.example/api/v2/components.json", "page_url": "https://status.example"})
+        cov = C.Coverage()
+        with mock.patch.object(C, "get_json", return_value=STATUSPAGE):
+            items = C.collect_statuspage(cfg, cov, SINCE)
+        self.assertEqual(len(items), 1)
+        self.assertIn("'Claude Cowork' under 'Claude Code'", items[0]["text"])
+        self.assertEqual(items[0]["platform"], "status")
+        self.assertEqual(cov.rows["statuspage"]["status"], "ok")
+
+    def test_careers_watch_regex_and_new_locations(self):
+        cfg = dict(CFG, careers={"name": "Anthropic", "greenhouse_board": "anthropic", "watch_regex": r"\b(investor relations|ipo)\b"})
+        state, cov = {}, C.Coverage()
+        with mock.patch.object(C, "get_json", return_value=JOBS1):
+            self.assertEqual(C.collect_careers(cfg, state, cov), [])                        # baseline
+        self.assertIn("baseline", cov.rows["careers"]["note"])
+        with mock.patch.object(C, "get_json", return_value=JOBS2):
+            items = C.collect_careers(cfg, state, cov)
+        self.assertEqual(sorted(i["id"] for i in items), ["job:2", "job:3"])               # IR title; first posting in Tokyo; the plain engineer role is ignored
+        self.assertIn("first posting in Tokyo, Japan", next(i for i in items if i["id"] == "job:3")["text"])
+        self.assertEqual(sorted(state["job_ids"]), [1, 2, 3, 4])
+        with mock.patch.object(C, "get_json", return_value=JOBS2):
+            self.assertEqual(C.collect_careers(cfg, state, cov), [])                        # nothing new on the next run
+
+    def test_sitemap_diff_expands_index_and_filters(self):
+        cfg = dict(CFG, sitemaps=[{"name": "site sitemap", "url": "https://site.example/sitemap.xml", "platform": "sitemap", "tier": "A", "exclude": "/careers"}])
+        state, cov = {}, C.Coverage()
+
+        def serve(child):
+            return lambda url, **k: (200, SITEMAP_INDEX if url.endswith("/sitemap.xml") else child, {})
+        with mock.patch.object(C, "http", side_effect=serve(SITEMAP_A)):
+            self.assertEqual(C.collect_sitemaps(cfg, state, cov), [])                       # baseline
+        self.assertEqual(len(state["sitemaps"]["site sitemap"]), 1)                         # the careers URL is excluded
+        with mock.patch.object(C, "http", side_effect=serve(SITEMAP_B)):
+            items = C.collect_sitemaps(cfg, state, cov)
+        self.assertEqual([i["url"] for i in items], ["https://site.example/news/claude-fable-9-launch"])
+        self.assertEqual(items[0]["title"], "claude fable 9 launch")
+        self.assertEqual(items[0]["platform"], "sitemap")
+        C.annotate_items(items, {})
+        self.assertTrue({"trip", "id", "newid"} <= set(items[0]["flags"]))                  # the slug alone names a model nobody has mentioned before
+
+    def test_watch_page_changes_are_tripwires(self):
+        cov, state = C.Coverage(), {}
+        cfg = dict(CFG, watch_pages=[{"name": "robots", "url": "https://site.example/robots.txt", "platform": "anthropic.com", "tier": "A", "min_len": 8}])
+        with mock.patch.object(C, "http", return_value=(200, "User-agent: *\nDisallow: /a\n", {})):
+            C.collect_watch_pages(cfg, state, cov)
+        with mock.patch.object(C, "http", return_value=(200, "User-agent: *\nDisallow: /a\nDisallow: /fable-9-launch\n", {})):
+            items = C.collect_watch_pages(cfg, state, cov)
+        self.assertEqual(len(items), 1)
+        self.assertIn("Disallow: /fable-9-launch", items[0]["extra"]["new_lines"])
+        self.assertIn("tripwire", items[0]["tags"])
 
 
 if __name__ == "__main__":
