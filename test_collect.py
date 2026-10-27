@@ -479,5 +479,97 @@ class TripwireTests(unittest.TestCase):
         self.assertIn("tripwire", items[0]["tags"])
 
 
+class DigestBalanceTests(unittest.TestCase):
+    """v1.2, from the first live digest: markets, releases and one platform's volume crowded out press, blogs and Hacker News, and boilerplate or product names set flags."""
+
+    def test_statuspage_boilerplate_is_not_a_leak(self):
+        text = "Elevated errors for Claude Sonnet 5.5. Oct 27, 15:09 UTC Identified - We are investigating. We will provide an update as soon as possible."
+        inc = mk("rss:s1", "status", "Claude status (incidents)", text, kind="incident", tier="A")
+        older = mk("x:s0", "x", "someone", "Claude Sonnet 5.5 is out", hours_ago=96)
+        C.annotate_items([inc, older], {})
+        self.assertNotIn("leak", inc["flags"])
+        self.assertIsNone(C.LEAK_RE.search("We will provide an update as soon as possible."))
+        self.assertIsNotNone(C.LEAK_RE.search("Shipping as soon as next week"))
+
+    def test_product_names_are_not_model_ids(self):
+        self.assertEqual(C.ids_in("claude-code 2.1 and claude-agent-sdk call the claude-api"), set())
+        self.assertEqual(C.ids_in("a stealth entry called claude-proxima in the picker"), {"claude-proxima"})        # an unknown codename still counts
+        gh = mk("gh:5", "github", "anthropics/claude-code", "v2.1.311 release", kind="release", tier="A", extra={"model_ids": ["claude-code"]})
+        C.annotate_items([gh], {})
+        self.assertEqual(gh["flags"], [])
+        self.assertNotIn("ids", C.compact(gh, 100))
+
+    def test_market_wording_is_not_a_rumor_flag(self):
+        mkt = mk("pm:9", "manifold", "Manifold", "Which of the following will be true about the rumored Claude Mythos? Spotted soon", kind="market", tier="market")
+        C.annotate_items([mkt], {})
+        self.assertEqual([f for f in mkt["flags"] if f in ("leak", "soon")], [])
+
+    def test_markets_are_capped_and_ladders_deduplicated(self):
+        ladder = [mk(f"pm:{i}", "polymarket", "Polymarket", f"Will Anthropic IPO on Nov {i}? Yes {i}%", kind="market", tier="market", metrics={"volume24h": 10 * (i + 1)},
+                     url=f"https://polymarket.com/event/anthropic-ipo-date/nov-{i:02d}", extra={"probability": i / 100}) for i in range(20)]
+        others = [mk(f"pm:x{i}", "polymarket", "Polymarket", f"Will Anthropic do thing {i}? Yes 10%", kind="market", tier="market", metrics={"volume24h": 50},
+                     url=f"https://polymarket.com/event/other-{i}/thing", extra={"probability": 0.1}) for i in range(15)]
+        manifold = [mk(f"mf:{i}", "manifold", "Manifold", f"Will Anthropic ship {i}? 30%", kind="market", tier="market", url=f"https://manifold.markets/u/q{i}") for i in range(12)]
+        dig = C.make_digest(ladder + others + manifold, CFG, C.Coverage(), {})
+        pm = [e for e in dig["items"] if e["plat"] == "polymarket"]
+        self.assertLessEqual(len(pm), 12)
+        self.assertLessEqual(len([e for e in dig["items"] if e["plat"] == "manifold"]), 8)
+        top = [e for e in pm if "anthropic-ipo-date" in e["url"]]
+        self.assertEqual(sorted(e["url"][-2:] for e in top), ["17", "18", "19"])                 # one event keeps its three highest-volume contracts
+        self.assertEqual(dig["overflow"]["n"] + dig["n_items"], 47)                              # nothing disappears: the rest is counted as overflow
+
+    def test_pile_on_about_one_new_identifier_is_limited_but_official_posts_are_not(self):
+        fans = [mk(f"x:{3000 + i}", "x", f"fan{i}", f"Fable 7 is coming this week, I can feel it #{i}", hours_ago=1 + i % 10, tier="C", metrics={"likes": 5 + i}) for i in range(40)]
+        official = mk("x:3999", "x", "claudeai", "Introducing Claude Fable 7", hours_ago=1, tier="A", tags=["always"])
+        dig = C.make_digest(fans + [official], CFG, C.Coverage(), {})
+        self.assertIn("3999", [e.get("sid") for e in dig["items"]])
+        kept = [e for e in dig["items"] if e["by"].startswith("fan")]
+        self.assertEqual(len(kept), C.NEWID_CAP)
+        self.assertTrue(all(e["corr"] == 41 for e in kept))                                      # corroboration still counts every author, kept or not
+
+    def test_every_source_type_gets_slots_when_other_sources_have_volume(self):
+        flagged = [mk(f"x:{4000 + i}", "x", f"leaker{i}", f"Spotted claude-codename-{i} in the picker, rolling out soon", hours_ago=1 + i % 20, tier="D", tags=["always"],
+                      metrics={"likes": 50 + i}) for i in range(25)]
+        staff = [mk(f"x:{4100 + i}", "x", f"staffer{i % 7}", f"Claude shipped feature {i}", hours_ago=2, tier="A", tags=["always"], metrics={"likes": 100}) for i in range(40)]
+        press = [mk(f"rss:p{i}", "press", "The Information", f"Anthropic plans {i}", kind="article", tier="C", title=f"Anthropic plans {i}") for i in range(6)]
+        hn = [mk(f"hn:{i}", "hn", "Hacker News", f"Claude story {i}", kind="story", metrics={"points": 20 * (i + 1), "comments": i}) for i in range(5)]
+        blog = [mk(f"rss:b{i}", "blog", "Simon Willison", f"Claude note {i}", kind="article", tier="B") for i in range(4)]
+        everything = flagged + staff + press + hn + blog
+        dig = C.make_digest([dict(i) for i in everything], dict(CFG, digest_budget_chars=14000), C.Coverage(), {})
+        plats = [e["plat"] for e in dig["items"]]
+        self.assertLess(len(plats), len(everything))                                             # the budget really was tight
+        self.assertGreaterEqual(plats.count("press"), 3)
+        self.assertGreaterEqual(plats.count("hn"), 3)
+        self.assertGreaterEqual(plats.count("blog"), 2)
+        self.assertEqual(dig["items"][0]["plat"], "x")                                           # real early signals still lead
+
+    def test_flagged_posts_cannot_use_the_whole_budget(self):
+        flagged = [mk(f"x:{7000 + i}", "x", f"leaker{i}", f"Spotted claude-codename-{i} in the picker, rolling out soon", tier="D", tags=["always"], metrics={"likes": 20}) for i in range(120)]
+        press = [mk(f"rss:q{i}", "press", "The Information", f"Anthropic plans {i}", kind="article", tier="C", title=f"Anthropic plans {i}") for i in range(3)]
+        dig = C.make_digest(flagged + press, CFG, C.Coverage(), {})
+        plats = [e["plat"] for e in dig["items"]]
+        self.assertEqual(plats.count("x"), C.HARD_CAPS["x"])
+        self.assertEqual(plats.count("press"), 3)
+
+    def test_replies_and_broad_trackers_need_a_keyword(self):
+        reply = mk("x:5001", "x", "bcherny", "@someone We're digging into this and will report back", kind="reply", tier="A", tags=["always"])
+        post = mk("x:5002", "x", "amorriscode", "bullish", tier="A", tags=["always"])
+        kw_reply = mk("x:5003", "x", "bcherny", "@someone Claude Code 2.2 fixes this", kind="reply", tier="A", tags=["always"])
+        self.assertEqual({c["id"] for c in C.digest_candidates([reply, post, kw_reply], CFG)}, {"x:5002", "x:5003"})
+        tc = next(a for a in CFG["x"]["accounts"] if a["handle"] == "testingcatalog")
+        self.assertFalse(tc.get("always"))                                                       # it covers every lab, so only its Anthropic posts qualify
+
+    def test_routine_sources_rank_below_signals_and_a_tripwire_does_not(self):
+        older = mk("x:6000", "x", "someone", "Claude Sonnet 5.5 is great", hours_ago=96)
+        incident = mk("rss:s9", "status", "Claude status (incidents)", "Elevated errors for Claude Sonnet 5.5", kind="incident", tier="A")
+        release = mk("gh:9", "github", "anthropics/claude-code", "v2.1.400 release", kind="release", tier="A")
+        staff = mk("x:6001", "x", "claudeai", "Introducing something", tier="A", tags=["always"], metrics={"likes": 200})
+        comp = mk("sp:1", "status", "Claude status (components)", "Status page added component 'Claude Fable 9'", kind="component_added", tier="A", tags=["tripwire"])
+        C.annotate_items([older, incident, release, staff, comp], {})
+        self.assertGreater(C.priority(staff), C.priority(incident))
+        self.assertGreater(C.priority(staff), C.priority(release))
+        self.assertGreater(C.priority(comp), C.priority(staff))
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=1)
