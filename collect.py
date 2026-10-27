@@ -1022,20 +1022,26 @@ def merge(prev_items, new_items, window_days):
 # (digest_budget_chars) instead of a fixed item count: items are ranked by an early-detection priority, lower-ranked items get shorter text,
 # and whatever still does not fit goes to signals_digest_more.json. The last key of the file is "complete": true, so a truncated read is detectable.
 PRIMARY_PLATFORMS = {"status", "anthropic.com", "docs.claude.com", "claude.com", "github", "npm", "appstore", "partner", "registry", "careers", "sitemap"}
-ROUTINE_PRIMARY = {"github", "npm"}                       # version bumps: primary evidence but low information unless a model id or flag is attached
+ROUTINE_PRIMARY = {"github", "npm", "status"}                       # version bumps: primary evidence but low information unless a model id or flag is attached
 MARKET_PLATFORMS = {"polymarket", "manifold"}
 SOCIAL_PLATFORMS = {"x", "reddit", "hn", "bluesky"}
 # per-platform ceilings; they apply to unflagged items only, so a flagged post is never crowded out by volume
-DIGEST_CAPS = {"x": 60, "reddit": 30, "hn": 20, "bluesky": 20, "substack": 20, "blog": 15, "newsletter": 12, "press": 25, "web": 12, "github": 12, "npm": 6}
+DIGEST_CAPS = {"x": 60, "reddit": 30, "hn": 20, "bluesky": 20, "substack": 20, "blog": 15, "newsletter": 12, "press": 25, "web": 12, "github": 8, "npm": 4, "status": 6, "polymarket": 12, "manifold": 8}
 TIER_BONUS = {"A": 30, "B": 20, "C": 12, "D": 6}
 STRONG_FLAGS = {"leak", "newid", "trip", "rising"}
+MARKET_PER_EVENT = 3          # a Polymarket event is often a ladder of dozens of near-identical contracts (dates, price bands): keep the three with the most volume
+PLATFORM_BASE = {"press": 40, "blog": 30, "newsletter": 30, "substack": 30, "hn": 20}    # sources without engagement counts need a starting score or they never rank
+FLOORS = {"press": 3, "blog": 2, "newsletter": 2, "substack": 3, "hn": 3, "reddit": 3, "bluesky": 3}    # the best few of each source type get FLOOR_BONUS ...
+FLOOR_BONUS = 60              # ... so volume on one platform cannot push every item of another out of the digest (young posts with engagement often carry "rising", about +15)
+NEWID_CAP = 8                 # a launch day brings a hundred posts about one new identifier: keep the best eight (corr still counts every author); official accounts are exempt
+HARD_CAPS = {"x": 90}         # unlike DIGEST_CAPS these also bind flagged items, so a pile-on cannot use the whole budget
 DEFAULT_TEXT_BANDS = [[25, 480], [80, 300], [150, 180], [100000, 110]]    # [rank below, text characters]
 
 LEAK_RE = re.compile(
     r"\b(?:leak(?:s|ed|ing|er|ers)?|rumou?r(?:s|ed)?|spotted|sighting|unreleased|unannounced|imminent|code[- ]?names?|feature[- ]?flags?|"
     r"a/b[- ]?test(?:s|ing)?|early[- ]access|eap|staging|stealth|cloaked|found (?:in|on|inside)|hidden (?:in|string|flag|model)|"
     r"people familiar|according to (?:a |two |three |several )?(?:sources?|people)|sources? (?:say|said|tell|told|familiar)|reportedly|"
-    r"scoop|exclusive|in talks|preparing to|set to (?:launch|release|announce|unveil|file|debut)|expected to|as soon as|"
+    r"scoop|exclusive|in talks|preparing to|set to (?:launch|release|announce|unveil|file|debut)|expected to|as soon as(?! possible)|"
     r"could (?:launch|release|ship|announce|debut)|about to|teas(?:er|ed|ing)|incoming|dropping (?:soon|today|tomorrow|next)|"
     r"rolling out|model[- ]ids?|system card|checkpoint)\b", re.I)
 SOON_RE = re.compile(
@@ -1084,8 +1090,16 @@ def norm_id(tok):
     return t.replace(".", "-") if re.fullmatch(r"claude-\d+(?:[.-]\d+)*", t) else t
 
 
+NON_MODEL_RE = re.compile(r"^claude-(?:code|agents?|api|ai|desktop|cowork|app|sdk|cli|for|max|pro|team|enterprise|plugins?|skills?|connectors?|mcp)(?:-|$)")
+
+
+def is_model_token(tok):
+    """Product and package names such as claude-code or claude-agent-sdk start with 'claude-' but are not models; an unknown codename still counts."""
+    return not NON_MODEL_RE.match(str(tok))
+
+
 def ids_in(text):
-    return {norm_id(m.group(0)) for m in ID_RE.finditer(text or "")}
+    return {t for t in (norm_id(m.group(0)) for m in ID_RE.finditer(text or "")) if is_model_token(t)}
 
 
 def text_of(it):
@@ -1112,7 +1126,7 @@ def annotate_items(items, state, recent_hours=48):
     seen_old = dict.fromkeys(sorted(HISTORIC_IDS) + list(state.get("seen_ids") or []))
     toks, recent_authors = {}, {}
     for it in items:
-        t = ids_in(text_of(it)) | {norm_id(i) for i in (it.get("extra") or {}).get("model_ids") or []}
+        t = ids_in(text_of(it)) | {x for x in (norm_id(i) for i in (it.get("extra") or {}).get("model_ids") or []) if is_model_token(x)}
         toks[id(it)] = t
         created = parse_dt(it.get("created_at")) or NOW
         if created < cutoff:
@@ -1122,10 +1136,13 @@ def annotate_items(items, state, recent_hours=48):
             for tok in t:
                 recent_authors.setdefault(tok, set()).add((it.get("author") or it.get("source") or "").lower())
     state["seen_ids"] = list(seen_old)[-1500:]
+    newmap = {}                                              # id(item) -> the identifiers it introduces, for the pile-on limit in make_digest
     for it in items:
         text, flags, t = text_of(it), [], toks[id(it)]
         created = parse_dt(it.get("created_at")) or NOW
-        if LEAK_RE.search(text):
+        if it["platform"] in MARKET_PLATFORMS:
+            pass                                             # a contract's wording ("rumored", "by November") is not itself a rumor
+        elif LEAK_RE.search(text):
             flags.append("leak")
         elif SOON_RE.search(text):
             flags.append("soon")
@@ -1134,6 +1151,7 @@ def annotate_items(items, state, recent_hours=48):
         new = [tok for tok in t if tok not in seen_old] if created >= cutoff else []
         if new:
             flags.append("newid")
+            newmap[id(it)] = sorted(new)
         corr = max((len(recent_authors.get(tok, ())) for tok in new), default=0)
         if corr >= 2:
             it["corr"] = corr
@@ -1144,18 +1162,22 @@ def annotate_items(items, state, recent_hours=48):
         if velocity(it) >= 6 and engagement(it) >= 20:
             flags.append("rising")
         it["flags"] = flags
+    return newmap
 
 
 def priority(it):
     plat, f, tags = it["platform"], set(it.get("flags") or []), it.get("tags") or []
+    routine = plat in ROUTINE_PRIMARY and "tripwire" not in tags       # releases and outage notices say little; a tripwire on the same source is another matter
     s = 0.0
-    if plat in ROUTINE_PRIMARY:
-        s += 60
+    if routine:
+        s += 25
     elif plat in PRIMARY_PLATFORMS:
         s += 100
     elif plat in MARKET_PLATFORMS:
-        s += 70
-    s += TIER_BONUS.get(it.get("tier"), 0) + (15 if "always" in tags else 0)
+        s += 50 + min(12.0, math.log10(1 + float((it.get("metrics") or {}).get("volume24h") or 0)) * 4)
+    else:
+        s += PLATFORM_BASE.get(plat, 0)
+    s += (0 if routine else TIER_BONUS.get(it.get("tier"), 0)) + (15 if "always" in tags else 0)
     s += 25 * ("leak" in f) + 8 * ("soon" in f) + 12 * ("id" in f) + 45 * ("newid" in f) + 60 * ("trip" in f) + 15 * ("rising" in f)
     s += min(30, 15 * max(0, int(it.get("corr") or 0) - 1))
     s += min(35, math.log2(1 + engagement(it)) * 4)
@@ -1220,8 +1242,9 @@ def compact(it, text_cap):
     if end:
         end_dt = parse_dt(end)
         e["end"] = end_dt.strftime("%Y-%m-%d") if end_dt else str(end)[:10]
-    if x.get("model_ids"):
-        e["ids"] = x["model_ids"][:6]
+    ids = [i for i in x.get("model_ids") or [] if is_model_token(norm_id(i))][:6]
+    if ids:
+        e["ids"] = ids
     if x.get("version"):
         e["ver"] = x["version"]
     if x.get("new_lines"):
@@ -1262,7 +1285,7 @@ def digest_candidates(items, cfg):
             keep = seen_at >= week
         else:
             text = text_of(it)
-            curated = "always" in tags and it.get("tier") in ("A", "B", None)    # official accounts and trusted trackers: every post
+            curated = "always" in tags and it.get("tier") in ("A", "B", None) and it.get("kind") != "reply"    # official accounts and trusted trackers: every post except replies, which must match a keyword
             keep = seen_at >= cutoff and bool(curated or kw.search(text) or (cn and cn.search(text)) or "id" in (it.get("flags") or []))
         if keep:
             out.append(it)
@@ -1288,19 +1311,40 @@ def _fit(ranked, avail, bands):
     return entries
 
 
+def event_key(it):
+    """Polymarket groups contracts into events; a ladder of dates or price bands is one event with many near-identical contracts."""
+    m = re.match(r"https?://polymarket\.com/event/([^/?#]+)", it.get("url") or "")
+    return m.group(1) if m else None
+
+
 def make_digest(items, cfg, cov, state):
-    annotate_items(items, state, cfg.get("digest_hours", 48))
+    newmap = annotate_items(items, state, cfg.get("digest_hours", 48))
     cands = digest_candidates(items, cfg)
-    cands.sort(key=lambda it: (priority(it), it.get("created_at", "")), reverse=True)
+    pri = {id(it): priority(it) for it in cands}
+    for plat, n in (cfg.get("digest_floors") or FLOORS).items():       # the best few of each source type get a bonus, so volume on one platform cannot push all of another out
+        for it in sorted((c for c in cands if c["platform"] == plat), key=lambda c: pri[id(c)], reverse=True)[:n]:
+            pri[id(it)] += FLOOR_BONUS
+    rank_key = lambda it: (pri[id(it)], it.get("created_at", ""))  # noqa: E731
+    cands.sort(key=rank_key, reverse=True)
     caps = cfg.get("digest_caps") or DIGEST_CAPS
-    ranked, capped, seen_n = [], [], {}
+    per_event, newid_cap = int(cfg.get("market_per_event", MARKET_PER_EVENT)), int(cfg.get("newid_cap", NEWID_CAP))
+    hard_caps = cfg.get("digest_hard_caps") or HARD_CAPS
+    ranked, capped, seen_n, seen_ev, seen_new = [], [], {}, {}, {}
     for it in cands:
-        plat = it["platform"]
-        weak = not (set(it.get("flags") or []) & STRONG_FLAGS) and "always" not in (it.get("tags") or []) and plat not in MARKET_PLATFORMS
-        if weak and plat in caps and seen_n.get(plat, 0) >= caps[plat]:
+        plat, ev, flags = it["platform"], event_key(it), set(it.get("flags") or [])
+        nk = (newmap.get(id(it)) or [None])[0]                                    # the first identifier this item introduces
+        weak = not (flags & STRONG_FLAGS) and "always" not in (it.get("tags") or [])
+        skip = weak and ((plat in caps and seen_n.get(plat, 0) >= caps[plat]) or (ev and seen_ev.get(ev, 0) >= per_event))
+        skip = skip or (bool(nk) and it.get("tier") != "A" and "trip" not in flags and seen_new.get(nk, 0) >= newid_cap)
+        skip = skip or seen_n.get(plat, 0) >= hard_caps.get(plat, 10 ** 9)
+        if skip:
             capped.append(it)
             continue
         seen_n[plat] = seen_n.get(plat, 0) + 1
+        if ev:
+            seen_ev[ev] = seen_ev.get(ev, 0) + 1
+        if nk:
+            seen_new[nk] = seen_new.get(nk, 0) + 1
         ranked.append(it)
     budget = int(cfg.get("digest_budget_chars", 56000))
     bands = cfg.get("digest_text_caps") or DEFAULT_TEXT_BANDS
@@ -1333,7 +1377,7 @@ def make_digest(items, cfg, cov, state):
         digest, kept, dropped = build(len(entries), entries)
     digest["budget"]["chars_used"] = budget                                          # placeholder with the same digit count as the final figure
     digest["budget"]["chars_used"] = len(dumps_digest(digest))
-    more = sorted(dropped, key=lambda it: (priority(it), it.get("created_at", "")), reverse=True)[:int(cfg.get("digest_more_max_items", 400))]
+    more = sorted(dropped, key=rank_key, reverse=True)[:int(cfg.get("digest_more_max_items", 400))]
     digest["_more"] = [compact(it, 240) for it in more]
     return digest
 
