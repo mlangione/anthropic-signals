@@ -13,7 +13,8 @@ Standard library only (Python 3.11+). Every source degrades to `skipped` or `err
 | Source | Needs | Notes |
 |---|---|---|
 | X: 25 seeded accounts (Anthropic staff, trackers, analysts, reporters) + 4 keyword searches | `X_BEARER_TOKEN` | v2 API, app-only bearer. Timelines use `since_id`, so each run reads only new posts. Searches run only at the hours in `sources.json → x.search_hours_utc` to keep paid reads predictable. Each run prints the posts read. |
-| Reddit: r/ClaudeAI, r/ClaudeCode, r/Anthropic (all posts); r/singularity, r/artificial, r/LocalLLaMA (keyword-filtered); two searches | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` | Free tier (100 QPM, non-commercial). Falls back to the public `.json` endpoints without credentials, which Reddit rate-limits hard. |
+| Reddit: r/ClaudeAI, r/ClaudeCode, r/Anthropic (all posts); r/singularity, r/artificial, r/LocalLLaMA (keyword-filtered); two searches | `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` — **only if you already hold approved credentials** | Skipped otherwise, never scraped. Reddit closed self-service API registration in Nov 2025 and announced (Sep 30, 2026) that RSS ends Nov 13, 2026 and public API access ends by Mar 2027. |
+| Reddit via search index: Google Alerts RSS feeds (`site:reddit.com` queries) and/or Brave Search API / Google Programmable Search | Google Alerts: nothing (paste the feed URL); `BRAVE_API_KEY` or `GOOGLE_CSE_KEY`+`GOOGLE_CSE_CX` | Compliant substitute for Reddit's closed API: titles, snippets, dates and URLs, no scores or comments. See SETUP.md step 4b. |
 | Hacker News (Algolia) | nothing | stories, Show HN, Ask HN mentioning Anthropic or Claude, ≥3 points |
 | Bluesky | nothing (optional `BSKY_HANDLE`/`BSKY_APP_PASSWORD`) | post search via the public AppView plus three author feeds; the session fallback is used only if search starts returning 401 |
 | RSS/Atom: Claude status page, AWS What's New, Vertex release notes, Import AI, Zvi, Simon Willison, Algorithmic Bridge, Interconnects, Latent Space, Platformer, Mollick, SemiAnalysis, Stratechery | nothing | keyword-filtered except the status page and the two Anthropic-centric newsletters |
@@ -40,9 +41,9 @@ Standard library only (Python 3.11+). Every source degrades to `skipped` or `err
    **Bearer Token** → repository secret `X_BEARER_TOKEN`. Expect roughly 500–800 reads a day with the
    default seed list (≈$75–120/month at the reported $0.005 per read; check the current price). Trim
    `x.accounts` or `x.searches` in `sources.json` to spend less.
-3. **Reddit**: at reddit.com/prefs/apps create a *script* app → secrets `REDDIT_CLIENT_ID`,
-   `REDDIT_CLIENT_SECRET`, and `REDDIT_USER_AGENT` in the form
-   `windows:anthropic-signals:1.0 (by /u/yourname)`. Free tier, personal/non-commercial use only.
+3. **Reddit**: skip unless you already hold approved Data API credentials (see SETUP.md step 4); if you do,
+   add `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET` and `REDDIT_USER_AGENT` in the form
+   `windows:anthropic-signals:1.0 (by /u/yourname)`.
 4. (Optional) **Bluesky** app password → `BSKY_HANDLE`, `BSKY_APP_PASSWORD`. Only needed if the public
    search endpoint starts returning 401 in the logs.
 5. Run the workflow once by hand (Actions → collect-anthropic-signals → Run workflow). The first run only
@@ -75,5 +76,5 @@ authoritative tier and the measured hit rate per source.
 
 ## Terms
 
-Stay within each platform's API terms: X data is read through the paid API, Reddit through the free
-non-commercial tier, everything else through public endpoints. Do not add scrapers for X or Reddit.
+Stay within each platform's API terms: X data is read through the paid API, Reddit only through approved
+OAuth credentials, everything else through public endpoints. Do not add scrapers for X or Reddit.

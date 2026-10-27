@@ -34,6 +34,9 @@ jobs:
           REDDIT_USER_AGENT: ${{ secrets.REDDIT_USER_AGENT }}
           BSKY_HANDLE: ${{ secrets.BSKY_HANDLE }}
           BSKY_APP_PASSWORD: ${{ secrets.BSKY_APP_PASSWORD }}
+          BRAVE_API_KEY: ${{ secrets.BRAVE_API_KEY }}
+          GOOGLE_CSE_KEY: ${{ secrets.GOOGLE_CSE_KEY }}
+          GOOGLE_CSE_CX: ${{ secrets.GOOGLE_CSE_CX }}
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           GIST_ID: ${{ vars.GIST_ID }}
           GIST_TOKEN: ${{ secrets.GIST_TOKEN }}

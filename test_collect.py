@@ -59,6 +59,20 @@ BSKY = {"posts": [{"uri": "at://did:plc:abc/app.bsky.feed.post/3k", "author": {"
                    "record": {"text": "Import AI this week covers Anthropic", "createdAt": RECENT}, "likeCount": 10, "repostCount": 2, "replyCount": 1, "quoteCount": 0,
                    "embed": {"external": {"uri": "https://importai.substack.com/p/import-ai-999"}}}]}
 
+GOOGLE_ALERTS = f"""<?xml version="1.0" encoding="UTF-8"?><feed xmlns="http://www.w3.org/2005/Atom" xmlns:idx="urn:atom-extension:indexing"><id>tag:google.com,2013:googlealerts/feed:1</id>
+<title>Google Alert - anthropic site:reddit.com</title><updated>{RECENT}</updated>
+<entry><id>tag:google.com,2013:googlealerts/feed:2</id><title type="html">Did &lt;b&gt;Claude&lt;/b&gt; just get a new model picker? : r/ClaudeAI</title>
+<link href="https://www.google.com/url?rct=j&amp;sa=t&amp;url=https://www.reddit.com/r/ClaudeAI/comments/abc1/model_picker/&amp;ct=ga&amp;cd=CAIyGjA&amp;usg=AOvVaw0"/>
+<published>{RECENT}</published><updated>{RECENT}</updated><content type="html">Saw a &lt;b&gt;Fable&lt;/b&gt; 5.2 option for a second this morning ...</content></entry>
+<entry><id>tag:google.com,2013:googlealerts/feed:3</id><title type="html">Anthropic IPO thread</title>
+<link href="https://www.google.com/url?rct=j&amp;sa=t&amp;url=https://www.example.com/not-reddit&amp;ct=ga"/><published>{RECENT}</published><content type="html">x</content></entry>
+</feed>"""
+
+BRAVE = {"web": {"results": [
+    {"title": "Claude Code 2.1.310 broke my hooks : r/ClaudeCode", "url": "https://www.reddit.com/r/ClaudeCode/comments/zzz1/broke_my_hooks/", "description": "Anyone else seeing this after the update?", "page_age": RECENT},
+    {"title": "Old thread", "url": "https://www.reddit.com/r/ClaudeAI/comments/old/", "description": "ancient", "page_age": "2024-01-01T00:00:00"},
+    {"title": "Undated result", "url": "https://www.reddit.com/r/Anthropic/comments/nodate/", "description": "no page_age field"}]}}
+
 NEWS_HTML = """<html><body><a href="/news">News</a><a href="/news/public-benefit-fund">Anthropic commits 5% of its shares to a new Public Benefit Fund</a>
 <a href="/news/public-benefit-fund">dup</a><a href="/research/formal-verification">Formal verification</a><a href="/news/x?utm=1">Short</a></body></html>"""
 
@@ -82,14 +96,39 @@ class ParserTests(unittest.TestCase):
         self.assertIn("Anthropic shipped", atom[0]["summary"])
 
     def test_collect_rss_filters_and_windows(self):
-        cfg = dict(CFG, rss=[{"name": "Status", "url": "u1", "platform": "status", "tier": "A", "filter": False, "kind": "incident"},
-                             {"name": "Simon", "url": "u2", "platform": "blog", "tier": "B", "filter": True, "kind": "article"}])
+        cfg = dict(CFG, rss=[{"name": "Status", "url": "https://status.example/history.rss", "platform": "status", "tier": "A", "filter": False, "kind": "incident"},
+                             {"name": "Simon", "url": "https://blog.example/atom", "platform": "blog", "tier": "B", "filter": True, "kind": "article"}])
         cov = C.Coverage()
-        with mock.patch.object(C, "http", side_effect=lambda url, **k: (200, RSS if url == "u1" else ATOM, {})):
+        with mock.patch.object(C, "http", side_effect=lambda url, **k: (200, RSS if "status" in url else ATOM, {})):
             items = C.collect_rss(cfg, cov, SINCE)
         titles = sorted(i["title"] for i in items)
         self.assertEqual(titles, ["Elevated errors for Claude Fable 5.1", "Notes on the new Claude release"])  # old incident and SQLite post dropped
         self.assertEqual(cov.rows["feeds"]["status"], "ok")
+
+    def test_google_alerts_feed_unwraps_links_and_labels_reddit(self):
+        cfg = dict(CFG, rss=[{"name": "GA", "url": "https://www.google.com/alerts/feeds/1/2", "platform": "reddit", "tier": "D", "filter": False, "kind": "post", "mixed_hosts": True},
+                             {"name": "placeholder", "url": "PASTE_ME", "platform": "reddit", "enabled": False}])
+        cov = C.Coverage()
+        with mock.patch.object(C, "http", return_value=(200, GOOGLE_ALERTS, {})):
+            items = C.collect_rss(cfg, cov, SINCE)
+        self.assertEqual(len(items), 2)
+        self.assertEqual(items[0]["url"], "https://www.reddit.com/r/ClaudeAI/comments/abc1/model_picker/")
+        self.assertEqual(items[0]["title"], "Did Claude just get a new model picker? : r/ClaudeAI")   # <b> tags stripped
+        self.assertEqual(items[0]["platform"], "reddit")
+        self.assertEqual(items[1]["platform"], "reddit")        # non-reddit link keeps the feed's configured platform
+        self.assertEqual(cov.rows["feeds"]["note"], "1 feeds OK")
+
+    def test_search_collector(self):
+        cov = C.Coverage()
+        self.assertEqual(C.collect_search(CFG, cov, (None, None, None), SINCE), [])
+        self.assertEqual(cov.rows["search"]["status"], "skipped")
+        with mock.patch.object(C, "get_json", return_value=BRAVE):
+            items = C.collect_search(CFG, cov, ("key", None, None), SINCE)
+        urls = sorted(i["url"] for i in items)
+        self.assertEqual(urls, ["https://www.reddit.com/r/Anthropic/comments/nodate/", "https://www.reddit.com/r/ClaudeCode/comments/zzz1/broke_my_hooks/"])  # old one dropped
+        self.assertTrue(all(i["platform"] == "reddit" for i in items))
+        self.assertIn("undated", next(i for i in items if "nodate" in i["url"])["tags"])
+        self.assertEqual(cov.rows["search"]["status"], "ok")
 
     def test_x_items(self):
         got = C.x_items_from_response(X_TIMELINE, default_author="bcherny", tier="A", always=True)
@@ -119,6 +158,9 @@ class ParserTests(unittest.TestCase):
         self.assertEqual(len(got), 1)
         self.assertEqual(got[0]["metrics"]["score"], 44)
         self.assertTrue(got[0]["url"].startswith("https://www.reddit.com/r/ClaudeAI/"))
+        cov = C.Coverage()
+        self.assertEqual(C.collect_reddit(CFG, cov, (None, None, None), SINCE), [])     # no scraping fallback
+        self.assertEqual(cov.rows["reddit"]["status"], "skipped")
 
     def test_markets(self):
         cov = C.Coverage()

@@ -17,6 +17,8 @@ Standard library only. Credentials come from environment variables and every sou
   X_BEARER_TOKEN                      X API v2 app-only bearer token (pay-per-use or Basic tier)
   REDDIT_CLIENT_ID, REDDIT_CLIENT_SECRET, REDDIT_USER_AGENT   Reddit "script" app (free tier, non-commercial)
   BSKY_HANDLE, BSKY_APP_PASSWORD      only needed if Bluesky post search starts requiring a session
+  BRAVE_API_KEY                       Brave Search API (free tier) for reddit.com-scoped searches; or
+  GOOGLE_CSE_KEY, GOOGLE_CSE_CX       Google Programmable Search JSON API for the same
   GITHUB_TOKEN                        optional; raises the GitHub API limit (set automatically in Actions)
   GIST_ID, GIST_TOKEN                 optional; also uploads the digest to a gist
 
@@ -303,26 +305,28 @@ def reddit_posts(listing, sub_name, tier, kw, filt, min_score):
 
 
 def collect_reddit(cfg, cov, creds, since_dt):
+    """Runs only with approved OAuth credentials. Reddit closed self-service API registration in November 2025 and
+    announced (Sept 30, 2026) that RSS ends Nov 13, 2026 and public Data API access ends by March 2027, so there is
+    deliberately no unauthenticated fallback: without credentials the source is skipped, not scraped."""
     rc = cfg.get("reddit") or {}
     kw = re.compile(cfg["keywords"], re.I)
     cid, secret, ua = creds
+    if not (cid and secret):
+        cov.skipped("reddit", "no approved API credentials (Reddit closed self-service registration; public API ends Mar 2027)")
+        return []
     items = []
     try:
-        if cid and secret:
-            tok = reddit_token(cid, secret, ua or UA)
-            base, hdr = "https://oauth.reddit.com", {"Authorization": f"bearer {tok}", "User-Agent": ua or UA}
-            suffix = ""
-        else:
-            base, hdr, suffix = "https://www.reddit.com", {"User-Agent": ua or UA}, ".json"
+        tok = reddit_token(cid, secret, ua or UA)
+        base, hdr = "https://oauth.reddit.com", {"Authorization": f"bearer {tok}", "User-Agent": ua or UA}
         for sub in rc.get("subreddits", []):
             for sort in ("new", "hot"):
-                data = get_json(f"{base}/r/{sub['name']}/{sort}{suffix}?limit=100&raw_json=1", headers=hdr)
+                data = get_json(f"{base}/r/{sub['name']}/{sort}?limit=100&raw_json=1", headers=hdr)
                 items.extend(reddit_posts(data, sub["name"], "D", kw, sub.get("filter", True), rc.get("min_score", 5)))
         for q in rc.get("searches", []):
-            data = get_json(f"{base}/search{suffix}?" + urllib.parse.urlencode({"q": q, "sort": "new", "t": "week", "limit": 100, "type": "link", "raw_json": 1}), headers=hdr)
+            data = get_json(f"{base}/search?" + urllib.parse.urlencode({"q": q, "sort": "new", "t": "week", "limit": 100, "type": "link", "raw_json": 1}), headers=hdr)
             items.extend(reddit_posts(data, "search", "D", kw, True, rc.get("min_score", 5)))
         items = [it for it in items if parse_dt(it["created_at"]) >= since_dt]
-        cov.ok("reddit", len(items), "OAuth" if cid else "unauthenticated .json endpoints")
+        cov.ok("reddit", len(items), "OAuth")
     except Exception as e:  # noqa: BLE001
         cov.error("reddit", e)
     return items
@@ -444,10 +448,33 @@ def parse_feed(xml_text):
     return entries
 
 
+def unwrap_redirect(url):
+    """Google Alerts (and some aggregators) wrap links as https://www.google.com/url?...&url=<target>&...; return the target."""
+    try:
+        p = urllib.parse.urlparse(url)
+        if p.netloc.endswith("google.com") and p.path == "/url":
+            target = urllib.parse.parse_qs(p.query).get("url") or urllib.parse.parse_qs(p.query).get("q")
+            if target:
+                return target[0]
+    except ValueError:
+        pass
+    return url
+
+
+def platform_for_url(url, default):
+    """A feed can carry links from many hosts (Google Alerts); label Reddit links as reddit so they are capped and tiered correctly."""
+    host = urllib.parse.urlparse(url).netloc.lower()
+    if host.endswith("reddit.com"):
+        return "reddit"
+    return default
+
+
 def collect_rss(cfg, cov, since_dt):
     kw = re.compile(cfg["keywords"], re.I)
     items, errors, n_feeds = [], [], 0
     for f in cfg.get("rss", []):
+        if f.get("enabled") is False or not str(f.get("url", "")).startswith("http"):
+            continue                                   # placeholder rows (e.g. a Google Alerts feed not yet created)
         try:
             status, body, _ = http(f["url"])
             if status != 200:
@@ -457,18 +484,76 @@ def collect_rss(cfg, cov, since_dt):
                 pub = parse_dt(e["published"])
                 if pub and pub < since_dt:
                     continue
+                title = strip_html(e["title"], 300)          # Google Alerts titles carry <b> tags
                 text = strip_html(e["summary"], 1200)
-                if f.get("filter", True) and not kw.search(e["title"] + " " + text):
+                if f.get("filter", True) and not kw.search(title + " " + text):
                     continue
-                eid = hashlib.sha1((e["id"] or e["link"] or e["title"]).encode()).hexdigest()[:16]
-                items.append(item(f"rss:{eid}", f.get("platform", "rss"), f["name"], e["link"], f"{e['title']}\n{text}".strip(), pub,
-                                  f.get("kind", "article"), title=e["title"], tier=f.get("tier")))
+                link = unwrap_redirect(e["link"])
+                eid = hashlib.sha1((link or e["id"] or title).encode()).hexdigest()[:16]
+                plat = platform_for_url(link, f.get("platform", "rss")) if f.get("mixed_hosts") else f.get("platform", "rss")
+                items.append(item(f"rss:{eid}", plat, f["name"], link, f"{title}\n{text}".strip(), pub,
+                                  f.get("kind", "article"), title=title, tier=f.get("tier")))
         except Exception as e:  # noqa: BLE001
             errors.append(f"{f['name']}: {str(e)[:80]}")
     if n_feeds:
         cov.ok("feeds", len(items), f"{n_feeds} feeds OK" + (f"; failed: {'; '.join(errors)}" if errors else ""))
     else:
         cov.error("feeds", "; ".join(errors) or "no feeds configured")
+    return items
+
+
+# ----------------------------------------------------------------------------- web search scoped to reddit.com (Brave Search API or Google Programmable Search)
+def collect_search(cfg, cov, keys, since_dt):
+    """Reddit threads via a search engine's index instead of Reddit's closed API: titles, snippets, dates and URLs
+    (no scores or comment counts). Brave Search API when BRAVE_API_KEY is set; Google Programmable Search when
+    GOOGLE_CSE_KEY and GOOGLE_CSE_CX are set; both if both are present. Free tiers cover this volume."""
+    sc = cfg.get("search") or {}
+    queries = sc.get("queries", [])
+    brave_key, g_key, g_cx = keys
+    if not queries:
+        cov.skipped("search", "no search.queries configured")
+        return []
+    if not brave_key and not (g_key and g_cx):
+        cov.skipped("search", "no BRAVE_API_KEY or GOOGLE_CSE_KEY/GOOGLE_CSE_CX")
+        return []
+    items, seen, notes = [], set(), []
+    days = int(sc.get("days", 7))
+
+    def add(url, title, snippet, when, engine):
+        url = unwrap_redirect(url)
+        if not url or url in seen:
+            return
+        seen.add(url)
+        created = parse_dt(when) if when else None
+        if created and created < since_dt:
+            return
+        items.append(item("search:" + hashlib.sha1(url.encode()).hexdigest()[:16], platform_for_url(url, "web"), f"{engine} search", url,
+                          f"{title}\n{snippet}".strip(), created, "search_hit", title=title, tier="D",
+                          tags=["search", "undated"] if not created else ["search"], extra={"engine": engine}))
+
+    if brave_key:
+        try:
+            freshness = "pd" if days <= 1 else ("pw" if days <= 7 else "pm")
+            for q in queries:
+                data = get_json("https://api.search.brave.com/res/v1/web/search?" + urllib.parse.urlencode({"q": q, "freshness": freshness, "count": sc.get("count", 20), "text_decorations": "false"}),
+                                headers={"X-Subscription-Token": brave_key})
+                for r in (data.get("web") or {}).get("results", []) or []:
+                    add(r.get("url", ""), strip_html(r.get("title", ""), 300), strip_html(r.get("description", ""), 600), r.get("page_age"), "Brave")
+            notes.append(f"Brave: {len(queries)} queries")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"Brave error: {str(e)[:80]}")
+    if g_key and g_cx:
+        try:
+            for q in queries:
+                data = get_json("https://www.googleapis.com/customsearch/v1?" + urllib.parse.urlencode({"key": g_key, "cx": g_cx, "q": q, "dateRestrict": f"d{days}", "sort": "date", "num": 10}))
+                for r in data.get("items", []) or []:
+                    meta = ((r.get("pagemap") or {}).get("metatags") or [{}])[0]
+                    when = meta.get("article:published_time") or meta.get("og:updated_time")
+                    add(r.get("link", ""), strip_html(r.get("title", ""), 300), strip_html(r.get("snippet", ""), 600), when, "Google")
+            notes.append(f"Google: {len(queries)} queries")
+        except Exception as e:  # noqa: BLE001
+            notes.append(f"Google error: {str(e)[:80]}")
+    cov.ok("search", len(items), "; ".join(notes))
     return items
 
 
@@ -726,7 +811,7 @@ def merge(prev_items, new_items, window_days):
 
 
 PRIMARY_PLATFORMS = {"status", "anthropic.com", "docs.claude.com", "claude.com", "github", "npm", "appstore", "partner"}
-DIGEST_CAPS = {"x": 70, "reddit": 40, "hn": 30, "bluesky": 30, "substack": 20, "blog": 10, "newsletter": 10, "polymarket": 15, "manifold": 10}
+DIGEST_CAPS = {"x": 70, "reddit": 40, "hn": 30, "bluesky": 30, "substack": 20, "blog": 10, "newsletter": 10, "polymarket": 15, "manifold": 10, "web": 15}
 
 
 def engagement(it):
@@ -835,6 +920,7 @@ def main():
     new += collect_hn(cfg, cov, since_dt)
     new += collect_bluesky(cfg, cov, (os.environ.get("BSKY_HANDLE"), os.environ.get("BSKY_APP_PASSWORD")), since_dt)
     new += collect_rss(cfg, cov, since_dt)
+    new += collect_search(cfg, cov, (os.environ.get("BRAVE_API_KEY"), os.environ.get("GOOGLE_CSE_KEY"), os.environ.get("GOOGLE_CSE_CX")), since_dt)
     new += collect_pages(cfg, cov, prev_by_id)
     new += collect_watch_pages(cfg, state, cov)
     new += collect_github(cfg, cov, os.environ.get("GITHUB_TOKEN"), since_dt)

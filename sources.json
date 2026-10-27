@@ -41,6 +41,7 @@
     ]
   },
   "reddit": {
+    "note": "Used only when approved OAuth credentials are present; Reddit closed self-service API registration (Nov 2025) and ends public API access by Mar 2027.",
     "subreddits": [
       {"name": "ClaudeAI", "filter": false},
       {"name": "ClaudeCode", "filter": false},
@@ -56,11 +57,24 @@
     "queries": ["Anthropic", "Claude"],
     "min_points": 3
   },
+  "search": {
+    "note": "Reddit via a search engine's index (Brave Search API or Google Programmable Search). Titles, snippets, dates and URLs only; no scores or comment counts. Runs when BRAVE_API_KEY or GOOGLE_CSE_KEY+GOOGLE_CSE_CX is set.",
+    "days": 7,
+    "count": 20,
+    "queries": [
+      "anthropic site:reddit.com",
+      "claude site:reddit.com/r/ClaudeAI",
+      "site:reddit.com/r/ClaudeCode",
+      "claude (leak OR rumor OR \"new model\" OR \"rate limit\") site:reddit.com"
+    ]
+  },
   "bluesky": {
     "searches": ["Anthropic", "Claude Code", "Claude model"],
     "accounts": ["simonwillison.net", "jackclark.bsky.social", "zvi.bsky.social"]
   },
   "rss": [
+    {"name": "Google Alerts: Anthropic on Reddit", "url": "PASTE_GOOGLE_ALERTS_FEED_URL_HERE", "platform": "reddit", "tier": "D", "filter": false, "kind": "post", "mixed_hosts": true, "enabled": false,
+     "note": "Create the alert at google.com/alerts with the query 'anthropic OR claude site:reddit.com', delivery 'RSS feed', then paste the feed URL and set enabled to true. Add one alert per subreddit if you want more depth, e.g. 'site:reddit.com/r/ClaudeCode'."},
     {"name": "Claude status (incidents)", "url": "https://status.claude.com/history.rss", "platform": "status", "tier": "A", "filter": false, "kind": "incident"},
     {"name": "AWS What's New", "url": "https://aws.amazon.com/about-aws/whats-new/recent/feed/", "platform": "partner", "tier": "A", "filter": true, "kind": "release"},
     {"name": "Google Cloud Vertex AI release notes", "url": "https://cloud.google.com/feeds/vertex-ai-release-notes.xml", "platform": "partner", "tier": "A", "filter": true, "kind": "release"},

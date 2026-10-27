@@ -1,7 +1,7 @@
 # Setting up the Anthropic signals collector — step by step
 
-Time: about 45 minutes, most of it waiting on account forms. You need a GitHub account (personal is fine),
-an X account and a Reddit account. Nothing here requires git on your machine; everything is done in a browser.
+Time: about 35 minutes, most of it in the X developer portal. You need a GitHub account (personal is fine)
+and an X account. Nothing here requires git on your machine; everything is done in a browser.
 
 The end state: a public GitHub repository runs `collect.py` four times a day and commits
 `data/signals_digest.json`; the dashboard's 8:00 AM task reads that file from its raw URL.
@@ -44,16 +44,45 @@ with "permission denied".)
    `x_reads_last_run`. To spend less, delete accounts from `sources.json → x.accounts`, lower
    `search_max_results`, or set `search_hours_utc` to a single hour.
 
-## Step 4 — Reddit API access (5 min)
+## Step 4 — Reddit: skip it (0 min)
 
-1. Signed in to Reddit, open reddit.com/prefs/apps → **create another app…**
-2. Name `anthropic-signals`, type **script**, redirect URI `http://localhost:8080` (unused but required) →
-   **create app**.
-3. The **client ID** is the short string under the app name; the **secret** is labelled "secret".
-4. Your user agent string must follow Reddit's format, e.g. `windows:anthropic-signals:1.0 (by /u/YOURNAME)`.
-5. If Reddit routes you to an API access request form instead of creating the app immediately, submit it and
-   carry on; the collector marks Reddit as `error` until the credentials work and everything else still runs.
-   The free tier is for personal, non-commercial use.
+Reddit is no longer a practical source for a new tool, so the collector skips it unless approved credentials
+are present (it never scrapes). What changed, with dates:
+
+- **November 2025** — Reddit closed self-service app creation ("Responsible Builder Policy"): new Data API
+  access needs a request form and manual approval; reported waits run weeks and many requests are denied.
+- **September 30, 2026** — Reddit announced that RSS feeds end on **November 13, 2026**, that public Data API
+  access ends by **March 2027**, and that already-approved apps must re-register on its Developer Platform by
+  **January 12, 2027** or lose access. After March 2027 programmatic Reddit data needs a commercial deal.
+
+If you already hold approved credentials from an earlier project, add `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`
+and `REDDIT_USER_AGENT` (format `windows:anthropic-signals:1.0 (by /u/YOURNAME)`) and the OAuth path will run until
+Reddit turns it off. Otherwise leave the three secrets out: the coverage table shows `reddit skipped` and
+nothing else is affected.
+
+### Step 4b — Reddit through a search engine's index instead (10 min, free)
+
+Search engines license or crawl Reddit and expose it through their own APIs, which is the compliant way to see
+new Reddit threads without Reddit's API. You get titles, snippets, dates and URLs, not scores or comment counts.
+Two options; either or both:
+
+**Google Alerts → RSS (zero code, 5 min).** At google.com/alerts create an alert with the query
+`anthropic OR claude site:reddit.com`; under "Show options" set *How often* to "As-it-happens", *Sources* to
+"Automatic", *Deliver to* **RSS feed**; click Create Alert, then click the RSS icon next to the alert and copy the
+feed URL (it looks like `https://www.google.com/alerts/feeds/<numbers>/<numbers>`). Paste it into
+`sources.json` → the first `rss` entry (replace `PASTE_GOOGLE_ALERTS_FEED_URL_HERE`) and set `"enabled": true`.
+Add a second alert for `site:reddit.com/r/ClaudeCode` if you want that subreddit in full. The collector
+unwraps Google's redirect links, strips the highlighting, and labels Reddit links as `reddit`.
+
+**Brave Search API (programmatic, 5 min).** At api-dashboard.search.brave.com sign up for the free "Data for
+Search" plan (around 2,000 queries a month; the collector uses about 16 a day, four queries on each of the four
+scheduled runs), create an API key, and add it as the repository secret `BRAVE_API_KEY`.
+Queries live in `sources.json → search.queries`; they are site-scoped to reddit.com and date-restricted to the
+last 7 days. Google's Programmable Search JSON API is supported the same way (`GOOGLE_CSE_KEY` + `GOOGLE_CSE_CX`,
+100 free queries a day) if you prefer Google's index.
+
+Threads found this way carry tier D in the dashboard, like any anonymous account, and the daily task treats the
+thread title and snippet as the claim text.
 
 ## Step 5 — Add the secrets to the repository (3 min)
 
@@ -62,13 +91,12 @@ Settings → **Secrets and variables** → **Actions** → **New repository secr
 | Name | Value |
 |---|---|
 | `X_BEARER_TOKEN` | the Bearer Token from step 3 |
-| `REDDIT_CLIENT_ID` | from step 4 |
-| `REDDIT_CLIENT_SECRET` | from step 4 |
-| `REDDIT_USER_AGENT` | `windows:anthropic-signals:1.0 (by /u/YOURNAME)` |
 
-Optional, only if a run's log shows Bluesky search returning 401: create an app password in Bluesky
-(Settings → Privacy and security → App passwords) and add `BSKY_HANDLE` and `BSKY_APP_PASSWORD`.
-`GITHUB_TOKEN` is provided automatically; `GIST_ID`/`GIST_TOKEN` are not needed.
+That is the only required secret. Optional ones: `BRAVE_API_KEY` (or `GOOGLE_CSE_KEY` + `GOOGLE_CSE_CX`) for
+Reddit-via-search (step 4b); `REDDIT_CLIENT_ID`, `REDDIT_CLIENT_SECRET`, `REDDIT_USER_AGENT` only if you already
+hold approved Reddit API credentials (step 4); `BSKY_HANDLE` and `BSKY_APP_PASSWORD` only if a run's log shows
+Bluesky search returning 401 (create an app password in Bluesky under Settings → Privacy and security → App
+passwords). `GITHUB_TOKEN` is provided automatically; `GIST_ID`/`GIST_TOKEN` are not needed.
 
 ## Step 6 — Run it twice by hand (5 min)
 
@@ -77,7 +105,8 @@ Optional, only if a run's log shows Bluesky search returning 401: create an app 
    **Collect** step: you should see a coverage table like
 
        x                ok          143  143 posts read (timelines + 4 searches)
-       reddit           ok           88  OAuth
+       reddit           skipped       0  no approved API credentials (Reddit closed self-service registration; public API ends Mar 2027)
+       search           ok           31  Brave: 4 queries
        hn               ok           21
        bluesky          ok           34  public AppView
        feeds            ok           19  13 feeds OK
@@ -120,8 +149,8 @@ The offline tests run at the start of every workflow run, so a malformed `source
 - **Commit data step fails ("permission denied" / "refusing to allow a GitHub App")** → step 2 was skipped.
 - **x error 402/403** → the plan or payment method is not active, or the secret is a user token rather than the
   app-only Bearer Token. **429** → rate-limited; the script backs off, and the next run continues from `since_id`.
-- **reddit error 401** → client ID/secret wrong. **403** or empty results → user agent not in Reddit's format.
-  Without credentials the script falls back to public `.json` endpoints, which Reddit throttles hard.
+- **reddit skipped** → expected without approved credentials (step 4). **reddit error 401** → client ID/secret
+  wrong; **403** → user agent not in Reddit's format, or Reddit has revoked access under the 2026 changes.
 - **bluesky error 401** → add the two BSKY secrets (step 5).
 - **feeds "failed: …"** → one feed URL changed; the others still load. Fix or remove it in `sources.json`.
 - **The schedule stops after a quiet period** → GitHub disables scheduled workflows after 60 days without
