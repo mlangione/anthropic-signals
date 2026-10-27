@@ -3,13 +3,17 @@
 
 Polls the sources listed in sources.json (X, Reddit, Hacker News, Bluesky, RSS/Atom feeds, the Claude
 status page, Anthropic's newsroom pages, GitHub releases, npm, watched docs pages, the App Store and
-prediction markets) and writes two files:
+prediction markets) plus tripwires for things that tend to appear before an announcement (model registries
+such as OpenRouter and LiteLLM, status-page components, the careers board, sitemaps) and writes three files:
 
-  <out>/signals_raw.json     every item seen in the last `window_days` days, with engagement metrics
-                             re-polled on each run (metrics_history) and the collector's own state
-                             (X user ids, since_ids, page hashes) so the next run only fetches what is new
-  <out>/signals_digest.json  the compact view the daily dashboard task reads: keyword matches from the
-                             last `digest_hours` hours, text trimmed, plus every primary-source item
+  <out>/signals_raw.json          every item seen in the last `window_days` days, with engagement metrics
+                                  re-polled on each run (metrics_history) and the collector's own state
+                                  (X user ids, since_ids, page hashes, registry keys) so the next run only fetches what is new
+  <out>/signals_digest.json       what the daily dashboard task reads: candidates from the last `digest_hours` hours
+                                  ranked best first by an early-detection priority (leak vocabulary, model ids, identifiers
+                                  never seen before, tripwires, rising engagement, source tier) and sized to
+                                  `digest_budget_chars` so a fetch tool cannot truncate it; it ends with "complete": true
+  <out>/signals_digest_more.json  the candidates that did not fit, same format
 
 Standard library only. Credentials come from environment variables and every source degrades to
 "skipped" or "error" in the coverage block instead of failing the run:
@@ -33,6 +37,7 @@ import datetime as dt
 import hashlib
 import html
 import json
+import math
 import os
 import re
 import sys
@@ -245,8 +250,9 @@ def collect_x(cfg, state, cov, token, since_dt):
         hours = xc.get("search_hours_utc") or []
         if not hours or NOW.hour in hours or os.environ.get("X_FORCE_SEARCH") == "1":
             search_since = dict(state.get("x_search_since_ids", {}))
-            for q in xc.get("searches", []):
-                params = {"query": q, "max_results": str(xc.get("search_max_results", 50)), "tweet.fields": X_TWEET_FIELDS,
+            for sq in xc.get("searches", []):
+                q, max_r = (sq["query"], sq.get("max_results")) if isinstance(sq, dict) else (sq, None)
+                params = {"query": q, "max_results": str(max(10, min(100, int(max_r or xc.get("search_max_results", 50))))), "tweet.fields": X_TWEET_FIELDS,
                           "expansions": "author_id", "user.fields": "username,public_metrics"}
                 key = hashlib.sha1(q.encode()).hexdigest()[:10]
                 if search_since.get(key):
@@ -476,7 +482,11 @@ def collect_rss(cfg, cov, since_dt):
         if f.get("enabled") is False or not str(f.get("url", "")).startswith("http"):
             continue                                   # placeholder rows (e.g. a Google Alerts feed not yet created)
         try:
-            status, body, _ = http(f["url"])
+            status, body = None, ""
+            for feed_url in [f["url"]] + list(f.get("fallbacks") or []):      # e.g. a Substack feed that answers 403 to datacenter IPs may have a mirror
+                status, body, _ = http(feed_url)
+                if status == 200:
+                    break
             if status != 200:
                 raise RuntimeError(f"HTTP {status}")
             n_feeds += 1
@@ -623,15 +633,15 @@ def collect_watch_pages(cfg, state, cov):
             status, body, _ = http(wp["url"])
             if status != 200:
                 raise RuntimeError(f"HTTP {status}")
-            text = body if wp["url"].endswith(".md") else strip_html(re.sub(r"<(script|style)\b.*?</\1>", " ", body, flags=re.S | re.I))
-            lines = [l.strip() for l in re.split(r"(?<=[.!?])\s+|\n+", text) if len(l.strip()) > 20][:600]
+            text = body if wp["url"].endswith((".md", ".txt")) else strip_html(re.sub(r"<(script|style)\b.*?</\1>", " ", body, flags=re.S | re.I))
+            lines = [l.strip() for l in re.split(r"(?<=[.!?])\s+|\n+", text) if len(l.strip()) > wp.get("min_len", 20)][:600]
             digest = hashlib.sha256(text.encode()).hexdigest()
             prev = pages.get(wp["url"])
             if prev and prev.get("hash") != digest:
                 new_lines = [l for l in lines if l not in set(prev.get("lines", []))][:12]
                 items.append(item("watch:" + hashlib.sha1((wp["url"] + digest).encode()).hexdigest()[:16], wp.get("platform", "web"), wp["name"], wp["url"],
                                   f"{wp['name']} changed. New text: " + " | ".join(new_lines)[:1000], NOW, "changelog", title=f"{wp['name']} changed", tier=wp.get("tier", "A"),
-                                  extra={"new_lines": new_lines}))
+                                  tags=["tripwire"], extra={"new_lines": new_lines}))
             pages[wp["url"]] = {"hash": digest, "lines": lines, "checked_at": iso(NOW)}
         except Exception as e:  # noqa: BLE001
             errors.append(f"{wp['name']}: {str(e)[:80]}")
@@ -772,6 +782,203 @@ def collect_markets(cfg, cov):
     return items
 
 
+# ----------------------------------------------------------------------------- tripwires: registries, status components, careers, sitemaps
+# Machine-readable places where an unannounced model, product, office or page tends to appear before the announcement. Each keeps a little
+# state so only changes become items; the first run records a baseline and emits nothing (except sources that carry their own timestamps).
+def _per_million(v):
+    try:
+        return f"${float(v) * 1e6:g}/M"
+    except (TypeError, ValueError):
+        return "?"
+
+
+def collect_registry(cfg, state, cov, since_dt):
+    rc = cfg.get("registry") or {}
+    if not rc:
+        cov.skipped("registry", "not configured")
+        return []
+    items, notes, fails = [], [], 0
+    orc = rc.get("openrouter")
+    if orc is not None:
+        try:
+            rx = re.compile(orc.get("regex", r"anthropic|claude|cloaked|stealth"), re.I)
+            data = get_json(orc.get("url", "https://openrouter.ai/api/v1/models")).get("data") or []
+            hits = 0
+            for m in data:
+                if not rx.search(f"{m.get('id', '')} {m.get('name', '')} {(m.get('description') or '')[:400]}"):
+                    continue
+                hits += 1
+                created = parse_dt(m.get("created"))
+                if not created or created < since_dt:
+                    continue
+                pr = m.get("pricing") or {}
+                known = bool(re.search(r"anthropic|claude", f"{m.get('id', '')} {m.get('name', '')}", re.I))
+                bits = [f"OpenRouter lists {m.get('id')} ({m.get('name')})" + ("" if known else "; provider not named (cloaked or stealth model)")]
+                if m.get("context_length"):
+                    bits.append(f"context {m['context_length']}")
+                if pr.get("prompt") is not None:
+                    bits.append(f"prompt {_per_million(pr.get('prompt'))}, completion {_per_million(pr.get('completion'))}")
+                text = "; ".join(bits) + f". {strip_html(m.get('description'), 240)}"
+                items.append(item(f"or:{m.get('id')}", "registry", "OpenRouter models", f"https://openrouter.ai/{m.get('id')}", text, created, "model_listed",
+                                  title=m.get("name") or m.get("id"), tier="B", tags=["tripwire"], extra={"model_ids": [m.get("id")]}))
+            notes.append(f"OpenRouter {len(data)} models ({hits} matched)")
+        except Exception as e:  # noqa: BLE001
+            fails += 1
+            notes.append(f"OpenRouter error: {str(e)[:80]}")
+    llc = rc.get("litellm")
+    if llc is not None:
+        try:
+            data = get_json(llc.get("url", "https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json"))
+            rx = re.compile(llc.get("regex", r"claude|anthropic"), re.I)
+            keys = sorted(k for k in data if isinstance(k, str) and k != "sample_spec" and rx.search(k))
+            prev = state.get("litellm_keys")
+            n_new = 0
+            if prev is not None:
+                known = set(prev)
+                for k in keys:
+                    if k in known:
+                        continue
+                    n_new += 1
+                    spec = data.get(k) if isinstance(data.get(k), dict) else {}
+                    bits = [f"provider {spec['litellm_provider']}"] if spec.get("litellm_provider") else []
+                    if spec.get("max_input_tokens"):
+                        bits.append(f"max input {spec['max_input_tokens']}")
+                    if spec.get("input_cost_per_token") is not None:
+                        bits.append(f"{_per_million(spec.get('input_cost_per_token'))} in, {_per_million(spec.get('output_cost_per_token'))} out")
+                    text = f"LiteLLM's model list gained {k}" + (f" ({'; '.join(bits)})" if bits else "")
+                    items.append(item(f"litellm:{k}", "registry", "LiteLLM model list", "https://github.com/BerriAI/litellm/blob/main/model_prices_and_context_window.json",
+                                      text, NOW, "model_listed", title=k, tier="B", tags=["tripwire"], extra={"model_ids": [k]}))
+            state["litellm_keys"] = sorted(set(prev or []) | set(keys))[-3000:]
+            notes.append(f"LiteLLM {len(keys)} claude/anthropic keys" + (f", {n_new} new" if prev is not None else " (baseline)"))
+        except Exception as e:  # noqa: BLE001
+            fails += 1
+            notes.append(f"LiteLLM error: {str(e)[:80]}")
+    if fails and fails == sum(x is not None for x in (orc, llc)):
+        cov.error("registry", "; ".join(notes))
+    else:
+        cov.ok("registry", len(items), "; ".join(notes))
+    return items
+
+
+def collect_statuspage(cfg, cov, since_dt):
+    """Atlassian Statuspage components: a new component (a product, model or surface) is often added before it is announced."""
+    sp = cfg.get("statuspage") or {}
+    if not sp.get("components_url"):
+        cov.skipped("statuspage", "not configured")
+        return []
+    try:
+        comps = get_json(sp["components_url"]).get("components") or []
+        names = {c.get("id"): c.get("name") for c in comps}
+        items = []
+        for c in comps:
+            created = parse_dt(c.get("created_at"))
+            if not created or created < since_dt:
+                continue
+            group = names.get(c.get("group_id"))
+            text = (f"Status page added component '{c.get('name')}'" + (f" under '{group}'" if group else "")
+                    + (f": {strip_html(c.get('description'), 160)}" if c.get("description") else ""))
+            items.append(item(f"sp:{c.get('id')}", "status", sp.get("name", "Status components"), sp.get("page_url", ""), text, created, "component_added",
+                              title=f"New status component: {c.get('name')}", tier="A", tags=["tripwire"], extra={"component": c.get("name")}))
+        cov.ok("statuspage", len(items), f"{len(comps)} components")
+        return items
+    except Exception as e:  # noqa: BLE001
+        cov.error("statuspage", e)
+        return []
+
+
+def _job_locations(j):
+    return {p.strip() for p in re.split(r"[|;]", (j.get("location") or {}).get("name") or "") if p.strip()}
+
+
+def collect_careers(cfg, state, cov):
+    """Greenhouse job board: new postings that match a watch pattern (IR, securities, silicon, hardware, country leads...) or open a new location."""
+    cc = cfg.get("careers") or {}
+    board = cc.get("greenhouse_board")
+    if not board:
+        cov.skipped("careers", "not configured")
+        return []
+    try:
+        jobs = get_json(f"https://boards-api.greenhouse.io/v1/boards/{board}/jobs").get("jobs") or []
+        rx = re.compile(cc.get("watch_regex") or r"$^", re.I)
+        prev_ids, prev_locs = state.get("job_ids"), state.get("job_locations")
+        known, known_locs = set(prev_ids or []), set(prev_locs or [])
+        items, n_new = [], 0
+        if prev_ids is not None:
+            for j in jobs:
+                if j.get("id") in known:
+                    continue
+                n_new += 1
+                title = j.get("title") or ""
+                new_locs = sorted(_job_locations(j) - known_locs)
+                if rx.search(title) or new_locs:
+                    loc = (j.get("location") or {}).get("name") or "location n/a"
+                    items.append(item(f"job:{j.get('id')}", "careers", f"{cc.get('name', board)} careers", j.get("absolute_url") or f"https://job-boards.greenhouse.io/{board}",
+                                      f"New opening: {title} ({loc})" + (f"; first posting in {', '.join(new_locs)}" if new_locs else ""),
+                                      parse_dt(j.get("first_published")) or parse_dt(j.get("updated_at")) or NOW, "job_posted", title=title, tier="A",
+                                      tags=["tripwire"], extra={"location": loc}))
+        state["job_ids"] = sorted(known | {j["id"] for j in jobs if j.get("id") is not None})[-3000:]
+        state["job_locations"] = sorted(known_locs | set().union(*[_job_locations(j) for j in jobs]))
+        cov.ok("careers", len(items), f"{len(jobs)} openings; " + (f"{n_new} new since last run" if prev_ids is not None else "baseline recorded"))
+        return items
+    except Exception as e:  # noqa: BLE001
+        cov.error("careers", e)
+        return []
+
+
+LOC_RE = re.compile(r"<loc>\s*([^<\s]+)\s*</loc>(?:\s*<lastmod>\s*([^<\s]+)\s*</lastmod>)?", re.I)
+
+
+def sitemap_urls(url, child_regex=None, max_children=6):
+    status, body, _ = http(url)
+    if status != 200:
+        raise RuntimeError(f"HTTP {status}")
+    pairs = LOC_RE.findall(body)
+    if "<sitemapindex" not in body[:3000].lower():
+        return {html.unescape(u): lm for u, lm in pairs}
+    crx = re.compile(child_regex) if child_regex else None
+    out = {}
+    for loc, _lm in [p for p in pairs if not crx or crx.search(p[0])][:max_children]:
+        st, sub, _ = http(html.unescape(loc))
+        if st == 200:
+            out.update({html.unescape(u): lm for u, lm in LOC_RE.findall(sub)})
+    return out
+
+
+def collect_sitemaps(cfg, state, cov):
+    """New URLs in a site's sitemap show up when a page is published, which can be before anything links to it. The slug alone is often a headline."""
+    sms = cfg.get("sitemaps") or []
+    if not sms:
+        cov.skipped("sitemaps", "not configured")
+        return []
+    store, items, notes, fails = dict(state.get("sitemaps") or {}), [], [], 0
+    for sm in sms:
+        try:
+            inc = re.compile(sm.get("include") or ".")
+            exc = re.compile(sm["exclude"]) if sm.get("exclude") else None
+            urls = {u: lm for u, lm in sitemap_urls(sm["url"], sm.get("child_regex"), sm.get("max_children", 6)).items() if inc.search(u) and not (exc and exc.search(u))}
+            by_hash = {hashlib.sha1(u.encode()).hexdigest()[:10]: u for u in urls}
+            prev = store.get(sm["name"])
+            if prev is not None:
+                known = set(prev)
+                for h, u in by_hash.items():
+                    if h in known:
+                        continue
+                    slug = u.rstrip("/").rsplit("/", 1)[-1].replace("-", " ")
+                    items.append(item(f"sitemap:{h}", sm.get("platform", "sitemap"), sm["name"], u, f"New URL in the {sm['name']}: {u} (slug: {slug})", NOW, "new_url",
+                                      title=slug, tier=sm.get("tier", "A"), tags=["tripwire", "new"], extra={"lastmod": urls[u]}))
+            store[sm["name"]] = sorted(set(prev or []) | set(by_hash))[-8000:]
+            notes.append(f"{sm['name']}: {len(by_hash)} URLs" + ("" if prev is not None else " (baseline)"))
+        except Exception as e:  # noqa: BLE001
+            fails += 1
+            notes.append(f"{sm.get('name')}: {str(e)[:80]}")
+    state["sitemaps"] = store
+    if fails == len(sms):
+        cov.error("sitemaps", "; ".join(notes))
+    else:
+        cov.ok("sitemaps", len(items), "; ".join(notes))
+    return items
+
+
 # ----------------------------------------------------------------------------- merge, digest, outputs
 METRIC_KEYS = ("likes", "reposts", "replies", "quotes", "views", "score", "comments", "points", "volume24h")
 
@@ -810,8 +1017,160 @@ def merge(prev_items, new_items, window_days):
     return out
 
 
-PRIMARY_PLATFORMS = {"status", "anthropic.com", "docs.claude.com", "claude.com", "github", "npm", "appstore", "partner"}
-DIGEST_CAPS = {"x": 70, "reddit": 40, "hn": 30, "bluesky": 30, "substack": 20, "blog": 10, "newsletter": 10, "polymarket": 15, "manifold": 10, "web": 15}
+# ----------------------------------------------------------------------------- early-detection flags, ranking and the size-budgeted digest
+# The dashboard task reads the digest through a fetch tool that truncates at roughly 25K tokens, so the digest is built to a character budget
+# (digest_budget_chars) instead of a fixed item count: items are ranked by an early-detection priority, lower-ranked items get shorter text,
+# and whatever still does not fit goes to signals_digest_more.json. The last key of the file is "complete": true, so a truncated read is detectable.
+PRIMARY_PLATFORMS = {"status", "anthropic.com", "docs.claude.com", "claude.com", "github", "npm", "appstore", "partner", "registry", "careers", "sitemap"}
+ROUTINE_PRIMARY = {"github", "npm"}                       # version bumps: primary evidence but low information unless a model id or flag is attached
+MARKET_PLATFORMS = {"polymarket", "manifold"}
+SOCIAL_PLATFORMS = {"x", "reddit", "hn", "bluesky"}
+# per-platform ceilings; they apply to unflagged items only, so a flagged post is never crowded out by volume
+DIGEST_CAPS = {"x": 60, "reddit": 30, "hn": 20, "bluesky": 20, "substack": 20, "blog": 15, "newsletter": 12, "press": 25, "web": 12, "github": 12, "npm": 6}
+TIER_BONUS = {"A": 30, "B": 20, "C": 12, "D": 6}
+STRONG_FLAGS = {"leak", "newid", "trip", "rising"}
+DEFAULT_TEXT_BANDS = [[25, 480], [80, 300], [150, 180], [100000, 110]]    # [rank below, text characters]
+
+LEAK_RE = re.compile(
+    r"\b(?:leak(?:s|ed|ing|er|ers)?|rumou?r(?:s|ed)?|spotted|sighting|unreleased|unannounced|imminent|code[- ]?names?|feature[- ]?flags?|"
+    r"a/b[- ]?test(?:s|ing)?|early[- ]access|eap|staging|stealth|cloaked|found (?:in|on|inside)|hidden (?:in|string|flag|model)|"
+    r"people familiar|according to (?:a |two |three |several )?(?:sources?|people)|sources? (?:say|said|tell|told|familiar)|reportedly|"
+    r"scoop|exclusive|in talks|preparing to|set to (?:launch|release|announce|unveil|file|debut)|expected to|as soon as|"
+    r"could (?:launch|release|ship|announce|debut)|about to|teas(?:er|ed|ing)|incoming|dropping (?:soon|today|tomorrow|next)|"
+    r"rolling out|model[- ]ids?|system card|checkpoint)\b", re.I)
+SOON_RE = re.compile(
+    r"\b(?:soon|coming|upcoming|next (?:week|month)|this week|tomorrow|tonight|new model|next[- ]gen|testing|alpha|beta|preview|waitlist|"
+    r"invite[- ]only|ipo|s-1|valuation|tender offer)\b", re.I)
+ID_RE = re.compile(r"\b(?:anthropic[/.])?claude[-_][a-z0-9]+(?:[-_.][a-z0-9]+)*|\bclaude ?\d+(?:[.-]\d+)*\b|\b(?:opus|sonnet|haiku|fable|mythos)[ -]?v?\d+(?:[.-]\d+)*\b", re.I)
+HISTORIC_IDS = {"claude-1", "claude-2", "claude-2-1", "claude-3", "claude-3-5", "claude-3-7", "claude-4", "claude-4-1", "claude-4-5", "claude-instant", "claude-code", "claude-ai",
+                "claude-agent-sdk", "claude-code-action", "opus-3", "opus-4", "opus-4-1", "opus-4-5", "sonnet-3", "sonnet-3-5", "sonnet-3-7", "sonnet-4", "sonnet-4-5",
+                "haiku-3", "haiku-3-5", "haiku-4-5"}      # names that predate the collector, so a mention of them is never a "new identifier"
+FAMILY_RE = re.compile(r"(?:(\d+(?:-\d+)*)-)?(opus|sonnet|haiku|fable|mythos)(?:-(\d+(?:-\d+)*))?(?:-.*)?")
+
+LEGEND = {
+    "plat": "platform", "by": "author handle (x, reddit, hn, bluesky)", "src": "outlet or source name (everything else)",
+    "tier": "source credibility prior: A official, B trusted tracker or analyst, C reporter or aggregator, D anonymous; absent for markets",
+    "at": "created, UTC", "sid": "x only: the post URL is https://x.com/<by>/status/<sid>", "url": "link (all platforms except x)",
+    "text": "headline or post text, trimmed harder for lower-ranked items", "metrics": "nonzero engagement counts", "fol": "author followers (x, tiers C/D only)",
+    "flags": "leak = rumor or leak vocabulary; soon = forward-looking vocabulary; id = a Claude model id or name in the text; newid = an identifier not seen in the earlier days; "
+             "rising = engagement climbing fast; trip = tripwire (registry, status component, careers, sitemap, watched page changed)",
+    "corr": "distinct authors who mentioned the same new identifier", "cites": "outbound link (non-x)", "prob": "market probability", "end": "market end date",
+    "ids": "model ids found", "ver": "package version", "new_lines": "new text on a watched page",
+}
+
+
+def minute(s):
+    d = parse_dt(s)
+    return d.strftime("%Y-%m-%dT%H:%MZ") if d else s
+
+
+def trim(s, n):
+    s = " ".join((s or "").split())
+    if len(s) <= n:
+        return s
+    cut = s[:max(n - 1, 1)]
+    head = cut.rsplit(" ", 1)[0]
+    return (head if len(head) >= 0.6 * len(cut) else cut).rstrip(" ,;:-") + "…"
+
+
+def norm_id(tok):
+    """One canonical spelling per model: 'claude-opus-4-5-20251101', 'anthropic/claude-opus-4.5' and 'Opus 4.5' all become 'opus-4-5'."""
+    t = re.sub(r"^(?:(?:us|eu|apac|global|jp|au|ca)\.)?(?:anthropic|bedrock|vertex[-_]ai|azure(?:_ai)?|openrouter)[/.]", "", str(tok).strip().lower())
+    t = re.sub(r"[\s_@]+", "-", t).strip(".-")
+    body = re.sub(r"-(?:20\d{6}|latest|v\d+(?::\d+)?)(?=-|$)", "", t[len("claude-"):] if t.startswith("claude-") else t).replace(".", "-")
+    m = FAMILY_RE.fullmatch(body)
+    if m:
+        return f"{m.group(2)}-{m.group(3) or m.group(1) or ''}".strip("-")
+    return t.replace(".", "-") if re.fullmatch(r"claude-\d+(?:[.-]\d+)*", t) else t
+
+
+def ids_in(text):
+    return {norm_id(m.group(0)) for m in ID_RE.finditer(text or "")}
+
+
+def text_of(it):
+    return f"{it.get('title') or ''} {it.get('text') or ''}"
+
+
+def velocity(it):
+    """Engagement points per hour: from the last two metric snapshots, else the lifetime average of a young item."""
+    now_e = engagement(it)
+    hist = it.get("metrics_history") or []
+    if hist:
+        t0, t1 = parse_dt(hist[-1].get("at")), parse_dt(it.get("last_seen")) or NOW
+        if t0 and t1 > t0:
+            return max(0.0, now_e - engagement({"metrics": hist[-1]})) / max((t1 - t0).total_seconds() / 3600.0, 0.5)
+    created = parse_dt(it.get("created_at")) or NOW
+    hrs = max((NOW - created).total_seconds() / 3600.0, 1.0)
+    return now_e / hrs if hrs <= 24 else 0.0
+
+
+def annotate_items(items, state, recent_hours=48):
+    """Early-detection flags, set in place on every item: leak / soon vocabulary, model-id mentions, identifiers first seen inside the digest window,
+    cross-author corroboration of those, rising engagement and tripwires. Identifiers older than the window are remembered in state['seen_ids']."""
+    cutoff = NOW - dt.timedelta(hours=recent_hours)
+    seen_old = dict.fromkeys(sorted(HISTORIC_IDS) + list(state.get("seen_ids") or []))
+    toks, recent_authors = {}, {}
+    for it in items:
+        t = ids_in(text_of(it)) | {norm_id(i) for i in (it.get("extra") or {}).get("model_ids") or []}
+        toks[id(it)] = t
+        created = parse_dt(it.get("created_at")) or NOW
+        if created < cutoff:
+            for tok in t:
+                seen_old.setdefault(tok)
+        elif it.get("kind") != "repost":                     # a repost repeats its origin, so it is not independent corroboration
+            for tok in t:
+                recent_authors.setdefault(tok, set()).add((it.get("author") or it.get("source") or "").lower())
+    state["seen_ids"] = list(seen_old)[-1500:]
+    for it in items:
+        text, flags, t = text_of(it), [], toks[id(it)]
+        created = parse_dt(it.get("created_at")) or NOW
+        if LEAK_RE.search(text):
+            flags.append("leak")
+        elif SOON_RE.search(text):
+            flags.append("soon")
+        if t:
+            flags.append("id")
+        new = [tok for tok in t if tok not in seen_old] if created >= cutoff else []
+        if new:
+            flags.append("newid")
+        corr = max((len(recent_authors.get(tok, ())) for tok in new), default=0)
+        if corr >= 2:
+            it["corr"] = corr
+        else:
+            it.pop("corr", None)
+        if "tripwire" in (it.get("tags") or []):
+            flags.append("trip")
+        if velocity(it) >= 6 and engagement(it) >= 20:
+            flags.append("rising")
+        it["flags"] = flags
+
+
+def priority(it):
+    plat, f, tags = it["platform"], set(it.get("flags") or []), it.get("tags") or []
+    s = 0.0
+    if plat in ROUTINE_PRIMARY:
+        s += 60
+    elif plat in PRIMARY_PLATFORMS:
+        s += 100
+    elif plat in MARKET_PLATFORMS:
+        s += 70
+    s += TIER_BONUS.get(it.get("tier"), 0) + (15 if "always" in tags else 0)
+    s += 25 * ("leak" in f) + 8 * ("soon" in f) + 12 * ("id" in f) + 45 * ("newid" in f) + 60 * ("trip" in f) + 15 * ("rising" in f)
+    s += min(30, 15 * max(0, int(it.get("corr") or 0) - 1))
+    s += min(35, math.log2(1 + engagement(it)) * 4)
+    fol = (it.get("metrics") or {}).get("followers")
+    if fol:
+        s += min(10, math.log10(1 + fol) * 2)
+    age_h = max(0.0, (NOW - (parse_dt(it.get("created_at")) or NOW)).total_seconds() / 3600.0)
+    s += 10 if age_h < 12 else 5 if age_h < 24 else 0
+    if it.get("kind") == "repost":
+        s -= 40
+    elif it.get("kind") == "reply":
+        s -= 5
+    if plat == "x" and "search" in tags and not f and "always" not in tags:
+        s -= 5
+    return s
 
 
 def engagement(it):
@@ -819,36 +1178,195 @@ def engagement(it):
     return sum(float(m.get(k) or 0) * w for k, w in (("likes", 1), ("reposts", 3), ("quotes", 3), ("replies", 0.5), ("score", 1), ("comments", 1), ("points", 2)))
 
 
-def make_digest(items, cfg, cov, state):
+def compact(it, text_cap):
+    """One digest line: short keys, empty fields dropped, X post URLs rebuilt from by + sid."""
+    plat = it["platform"]
+    e = {"plat": plat}
+    if plat in SOCIAL_PLATFORMS:
+        e["by"] = it.get("author") or it.get("source")
+    else:
+        e["src"] = it.get("source")
+    if it.get("tier"):
+        e["tier"] = it["tier"]
+    e["at"] = minute(it.get("created_at"))
+    if it.get("kind") not in (None, "post", "story", "article"):
+        e["kind"] = it["kind"]
+    if plat == "x" and str(it.get("id", "")).startswith("x:"):
+        e["sid"] = it["id"][2:]
+    else:
+        e["url"] = it.get("url")
+    text = " ".join((it.get("text") or "").split())
+    title = " ".join((it.get("title") or "").split())
+    if title and text.startswith(title):                      # headline-first feeds repeat the title at the start of the text
+        text = text[len(title):].lstrip(" \n:-—")
+        text = f"{title}. {text}" if text else title
+    e["text"] = trim(text, text_cap)
+    m = {k: v for k, v in (it.get("metrics") or {}).items() if v and k not in ("views", "followers", "liquidity", "volume")}
+    if m:
+        e["metrics"] = m
+    fol = (it.get("metrics") or {}).get("followers")
+    if plat == "x" and fol and it.get("tier") in (None, "C", "D"):
+        e["fol"] = fol
+    if it.get("flags"):
+        e["flags"] = it["flags"]
+    if it.get("corr"):
+        e["corr"] = it["corr"]
+    if plat not in ("x",) and it.get("cites"):
+        e["cites"] = it["cites"][0]
+    x = it.get("extra") or {}
+    if x.get("probability") is not None:
+        e["prob"] = round(x["probability"], 3)
+    end = x.get("end_date") or x.get("close_time")
+    if end:
+        end_dt = parse_dt(end)
+        e["end"] = end_dt.strftime("%Y-%m-%d") if end_dt else str(end)[:10]
+    if x.get("model_ids"):
+        e["ids"] = x["model_ids"][:6]
+    if x.get("version"):
+        e["ver"] = x["version"]
+    if x.get("new_lines"):
+        e["new_lines"] = [trim(l, 140) for l in x["new_lines"][:6]]
+    return e
+
+
+def _cj(o):
+    return json.dumps(o, ensure_ascii=False, separators=(",", ":"))
+
+
+def dumps_lines(head, items, tail=None):
+    """Plain valid JSON with one line per header key and per item: compact, diff-friendly, readable by a person and by a fetch tool."""
+    parts = [f" {json.dumps(k)}:{_cj(v)}" for k, v in head.items()]
+    parts.append(' "items":[\n' + ",\n".join(_cj(it) for it in items) + "\n ]")
+    parts += [f" {json.dumps(k)}:{_cj(v)}" for k, v in (tail or {}).items()]
+    return "{\n" + ",\n".join(parts) + "\n}\n"
+
+
+def dumps_digest(d):
+    head = {k: v for k, v in d.items() if k not in ("items", "complete") and not k.startswith("_")}
+    return dumps_lines(head, d["items"], {"complete": True})
+
+
+def digest_candidates(items, cfg):
     kw = re.compile(cfg["keywords"], re.I)
+    cn = re.compile(r"\b(?:" + "|".join(re.escape(c) for c in cfg["codenames"]) + r")\b", re.I) if cfg.get("codenames") else None
     cutoff = NOW - dt.timedelta(hours=cfg.get("digest_hours", 48))
-    picked, counts = [], {}
-    for it in items:
-        plat = it["platform"]
-        created = parse_dt(it.get("created_at")) or NOW
-        first_seen = parse_dt(it.get("first_seen")) or created
-        if "baseline" in it.get("tags", []):
-            continue                                       # undated links recorded on the collector's first run
-        if plat in PRIMARY_PLATFORMS or plat in ("polymarket", "manifold"):
-            keep = max(created, first_seen) >= NOW - dt.timedelta(days=cfg.get("window_days", 7))
-        else:
-            keep = max(created, first_seen) >= cutoff and ("always" in it.get("tags", []) or kw.search((it.get("title") or "") + " " + it.get("text", "")))
-        if keep:
-            picked.append(it)
-    picked.sort(key=lambda x: (x["platform"] in PRIMARY_PLATFORMS, engagement(x), x.get("created_at", "")), reverse=True)
+    week = NOW - dt.timedelta(days=cfg.get("window_days", 7))
     out = []
-    for it in picked:
+    for it in items:
+        plat, tags = it["platform"], it.get("tags") or []
+        created = parse_dt(it.get("created_at")) or NOW
+        seen_at = max(created, parse_dt(it.get("first_seen")) or created)
+        if "baseline" in tags:
+            continue                                       # undated links recorded on the collector's first run
+        if plat in PRIMARY_PLATFORMS or plat in MARKET_PLATFORMS:
+            keep = seen_at >= week
+        else:
+            text = text_of(it)
+            curated = "always" in tags and it.get("tier") in ("A", "B", None)    # official accounts and trusted trackers: every post
+            keep = seen_at >= cutoff and bool(curated or kw.search(text) or (cn and cn.search(text)) or "id" in (it.get("flags") or []))
+        if keep:
+            out.append(it)
+    return out
+
+
+def _fit(ranked, avail, bands):
+    """Compact entries for as many of `ranked` (best first) as fit in `avail` characters; lower ranks get shorter text before anything is dropped."""
+    top = bands[0][0]
+    entries, total = [], 0
+    for shrink in (1.0, 0.75, 0.55):
+        entries = []
+        for i, it in enumerate(ranked):
+            cap = next(c for upto, c in bands if i < upto)
+            if i >= top:
+                cap = max(80, int(cap * shrink))
+            entries.append(compact(it, cap))
+        total = sum(len(_cj(e)) + 2 for e in entries)
+        if total <= avail:
+            return entries
+    while entries and total > avail:
+        total -= len(_cj(entries.pop())) + 2
+    return entries
+
+
+def make_digest(items, cfg, cov, state):
+    annotate_items(items, state, cfg.get("digest_hours", 48))
+    cands = digest_candidates(items, cfg)
+    cands.sort(key=lambda it: (priority(it), it.get("created_at", "")), reverse=True)
+    caps = cfg.get("digest_caps") or DIGEST_CAPS
+    ranked, capped, seen_n = [], [], {}
+    for it in cands:
         plat = it["platform"]
-        cap = DIGEST_CAPS.get(plat, 50)
-        if plat not in PRIMARY_PLATFORMS and counts.get(plat, 0) >= cap:
+        weak = not (set(it.get("flags") or []) & STRONG_FLAGS) and "always" not in (it.get("tags") or []) and plat not in MARKET_PLATFORMS
+        if weak and plat in caps and seen_n.get(plat, 0) >= caps[plat]:
+            capped.append(it)
             continue
-        counts[plat] = counts.get(plat, 0) + 1
-        m = {k: v for k, v in (it.get("metrics") or {}).items() if v is not None}
-        out.append({"id": it["id"], "platform": plat, "source": it["source"], "author": it.get("author"), "tier": it.get("tier"), "url": it["url"],
-                    "created_at": it["created_at"], "kind": it["kind"], "text": " ".join(it.get("text", "").split())[:320], "metrics": m,
-                    "cites": it.get("cites", [])[:3], "tags": it.get("tags", []), **({"extra": {k: v for k, v in it["extra"].items() if k in ("probability", "end_date", "model_ids", "version", "new_lines", "query")}} if it.get("extra") else {})})
-    return {"schema": "signals_digest/1", "lab": cfg["lab"], "collected_at": iso(NOW), "digest_hours": cfg.get("digest_hours", 48),
-            "coverage": cov.rows, "counts": counts, "x_reads_last_run": state.get("x_reads_last_run"), "items": out}
+        seen_n[plat] = seen_n.get(plat, 0) + 1
+        ranked.append(it)
+    budget = int(cfg.get("digest_budget_chars", 56000))
+    bands = cfg.get("digest_text_caps") or DEFAULT_TEXT_BANDS
+
+    def build(n_keep, entries):
+        kept, dropped = ranked[:n_keep], ranked[n_keep:] + capped
+        counts, over = {}, {}
+        for it in kept:
+            counts[it["platform"]] = counts.get(it["platform"], 0) + 1
+        for it in dropped:
+            over[it["platform"]] = over.get(it["platform"], 0) + 1
+        d = {"schema": "signals_digest/2", "lab": cfg["lab"], "collected_at": iso(NOW), "digest_hours": cfg.get("digest_hours", 48),
+             "read_me": "Items are ranked best first. This file is complete only if the last key is \"complete\":true; otherwise your fetch was truncated, so say so. "
+                        "Items that did not fit are in signals_digest_more.json (same format).",
+             "legend": LEGEND, "n_items": len(entries), "overflow": {"n": len(dropped), "by_plat": over, "file": "signals_digest_more.json"},
+             "budget": {"chars_limit": budget}, "coverage": cov.rows, "counts": counts, "x_reads_last_run": state.get("x_reads_last_run"),
+             "items": entries, "_more": dropped}
+        return d, kept, dropped
+
+    probe, _, _ = build(0, [])
+    plats = sorted({it["platform"] for it in ranked + capped})
+    probe["overflow"] = {"n": 99999, "by_plat": {p: 9999 for p in plats}, "file": "signals_digest_more.json"}
+    probe["counts"] = {p: 9999 for p in plats}
+    probe["budget"] = {"chars_limit": budget, "chars_used": budget}
+    reserve = len(dumps_digest(probe)) + 200
+    entries = _fit(ranked, budget - reserve, bands)
+    digest, kept, dropped = build(len(entries), entries)
+    while len(dumps_digest(digest)) > budget and digest["items"]:                  # safety net: the reserve was an estimate
+        entries.pop()
+        digest, kept, dropped = build(len(entries), entries)
+    digest["budget"]["chars_used"] = budget                                          # placeholder with the same digit count as the final figure
+    digest["budget"]["chars_used"] = len(dumps_digest(digest))
+    more = sorted(dropped, key=lambda it: (priority(it), it.get("created_at", "")), reverse=True)[:int(cfg.get("digest_more_max_items", 400))]
+    digest["_more"] = [compact(it, 240) for it in more]
+    return digest
+
+
+def plain_digest(items, cfg, cov, state):
+    """Last-resort digest used only if ranking fails, so a bug in the ranking can never stop the data from updating."""
+    cutoff = NOW - dt.timedelta(hours=cfg.get("digest_hours", 48))
+    pool = [it for it in items if "baseline" not in (it.get("tags") or []) and (parse_dt(it.get("created_at")) or NOW) >= cutoff]
+    pool.sort(key=lambda it: it.get("created_at", ""), reverse=True)
+    rows = [{"plat": it.get("platform"), "src": it.get("author") or it.get("source"), "at": minute(it.get("created_at")), "url": it.get("url"),
+             "text": trim(it.get("text"), 200)} for it in pool[:150]]
+    return {"schema": "signals_digest/2", "lab": cfg["lab"], "collected_at": iso(NOW), "digest_hours": cfg.get("digest_hours", 48),
+            "read_me": "Plain fallback digest: ranking failed this run (see coverage.digest). Newest first, no flags. This file is complete only if the last key is \"complete\":true.",
+            "n_items": len(rows), "overflow": {"n": max(0, len(pool) - len(rows)), "by_plat": {}, "file": "signals_digest_more.json"},
+            "budget": {"chars_limit": int(cfg.get("digest_budget_chars", 56000))}, "coverage": cov.rows, "counts": {},
+            "x_reads_last_run": state.get("x_reads_last_run"), "items": rows, "_more": []}
+
+
+def make_digest_safely(items, cfg, cov, state):
+    try:
+        return make_digest(items, cfg, cov, state)
+    except Exception as e:  # noqa: BLE001
+        print(f"  ! digest ranking failed ({e}); writing a plain digest", file=sys.stderr)
+        cov.error("digest", e)
+        return plain_digest(items, cfg, cov, state)
+
+
+def dumps_more(digest, cfg):
+    d = {"schema": "signals_digest_more/2", "lab": cfg["lab"], "collected_at": digest["collected_at"], "read_me": "Items that did not fit in signals_digest.json, ranked best first; same keys (see the legend there).",
+         "n_items": len(digest["_more"])}
+    return dumps_lines(d, digest["_more"], {"complete": True})
+
+
 
 
 def upload_gist(gist_id, token, files):
@@ -862,7 +1380,7 @@ def upload_gist(gist_id, token, files):
 
 def create_gist(token):
     body = json.dumps({"description": "Anthropic signals collector output", "public": True,
-                       "files": {"signals_digest.json": {"content": json.dumps({"schema": "signals_digest/1", "items": []})}}})
+                       "files": {"signals_digest.json": {"content": json.dumps({"schema": "signals_digest/2", "items": []})}}})
     status, resp, _ = http("https://api.github.com/gists", headers={"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json", "Content-Type": "application/json"},
                            data=body, method="POST", accept_json=True)
     if status != 201:
@@ -881,6 +1399,7 @@ def main():
     ap.add_argument("--out", default=os.path.join(HERE, "data"))
     ap.add_argument("--no-x", action="store_true")
     ap.add_argument("--no-reddit", action="store_true")
+    ap.add_argument("--no-tripwires", action="store_true", help="skip the registry, status-component, careers and sitemap tripwires")
     ap.add_argument("--create-gist", action="store_true")
     ap.add_argument("--max-seconds", type=int, default=900, help="stop starting new requests after this many seconds")
     args = ap.parse_args()
@@ -927,26 +1446,37 @@ def main():
     new += collect_npm(cfg, cov, since_dt)
     new += collect_appstore(cfg, cov, since_dt)
     new += collect_markets(cfg, cov)
+    if args.no_tripwires:
+        for plat in ("registry", "statuspage", "careers", "sitemaps"):
+            cov.skipped(plat, "--no-tripwires")
+    else:
+        new += collect_registry(cfg, state, cov, since_dt)
+        new += collect_statuspage(cfg, cov, since_dt)
+        new += collect_careers(cfg, state, cov)
+        new += collect_sitemaps(cfg, state, cov)
 
     items = merge(prev_items, new, cfg.get("window_days", 7))
-    raw = {"schema": "signals_raw/1", "lab": cfg["lab"], "collected_at": iso(NOW), "window_days": cfg.get("window_days", 7),
-           "coverage": cov.rows, "state": state, "items": items}
-    digest = make_digest(items, cfg, cov, state)
+    digest = make_digest_safely(items, cfg, cov, state)   # annotates items with flags and updates state, so it runs before raw is written
+    raw_head = {"schema": "signals_raw/1", "lab": cfg["lab"], "collected_at": iso(NOW), "window_days": cfg.get("window_days", 7), "coverage": cov.rows, "state": state}
 
     os.makedirs(args.out, exist_ok=True)
-    with open(os.path.join(args.out, "signals_raw.json"), "w", encoding="utf-8") as fh:
-        json.dump(raw, fh, ensure_ascii=False, indent=1)
-    with open(os.path.join(args.out, "signals_digest.json"), "w", encoding="utf-8") as fh:
-        json.dump(digest, fh, ensure_ascii=False, indent=1)
+    out_path = lambda name: os.path.join(args.out, name)  # noqa: E731
+    with open(out_path("signals_raw.json"), "w", encoding="utf-8") as fh:
+        fh.write(dumps_lines(raw_head, items))
+    digest_text, more_text = dumps_digest(digest), dumps_more(digest, cfg)
+    with open(out_path("signals_digest.json"), "w", encoding="utf-8") as fh:
+        fh.write(digest_text)
+    with open(out_path("signals_digest_more.json"), "w", encoding="utf-8") as fh:
+        fh.write(more_text)
     for plat, row in cov.rows.items():
         print(f"  {plat:16s} {row['status']:8s} {row['count']:5d}  {row['note'][:90]}")
-    print(f"{len(new)} new items this run; {len(items)} in window; digest {len(digest['items'])} items "
-          f"({os.path.getsize(os.path.join(args.out, 'signals_digest.json')) // 1024} KB)")
+    print(f"{len(new)} new items this run; {len(items)} in window; digest {len(digest['items'])} items, {digest['overflow']['n']} to overflow "
+          f"({len(digest_text)} of {digest['budget']['chars_limit']} chars; more file {len(more_text) // 1024} KB)")
 
     gist_id, gist_token = os.environ.get("GIST_ID"), os.environ.get("GIST_TOKEN")
     if gist_id and gist_token:
         try:
-            upload_gist(gist_id, gist_token, {"signals_digest.json": json.dumps(digest, ensure_ascii=False, indent=1)})
+            upload_gist(gist_id, gist_token, {"signals_digest.json": digest_text, "signals_digest_more.json": more_text})
             print(f"digest uploaded to gist {gist_id}")
         except Exception as e:  # noqa: BLE001
             print(f"  ! gist upload failed: {e}", file=sys.stderr)
