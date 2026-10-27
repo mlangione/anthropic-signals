@@ -2,7 +2,7 @@ name: collect-anthropic-signals
 
 on:
   schedule:
-    - cron: "15 */6 * * *"
+    - cron: "15 */6 * * *"      # 00:15, 06:15, 12:15, 18:15 UTC; X keyword searches run only in the 06 and 18 UTC runs (sources.json)
   workflow_dispatch: {}
 
 permissions:
@@ -46,6 +46,6 @@ jobs:
         run: |
           git config user.name "signals-collector"
           git config user.email "signals-collector@users.noreply.github.com"
-          git add data/signals_raw.json data/signals_digest.json
+          git add data/signals_raw.json data/signals_digest.json data/signals_digest_more.json
           git commit -m "collect $(date -u +%Y-%m-%dT%H:%MZ)" || echo "nothing to commit"
           git push
