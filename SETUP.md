@@ -38,8 +38,8 @@ with "permission denied".)
    Basic is the fallback; it is roughly $200/month and more than this collector needs.
 3. In the app's **Keys and tokens** tab, generate the **Bearer Token** (app-only authentication). Copy it
    once; it is shown a single time. You do not need the API key/secret pair or any user tokens.
-4. Budget: the default seed list reads roughly 500–800 posts a day (timelines fetch only new posts; the four
-   keyword searches run twice daily). At the reported $0.005 per post read that is about $75–120 a month.
+4. Budget: the default seed list reads roughly 800–1,100 posts a day (timelines fetch only new posts; the seven
+   keyword searches run twice daily). At the reported $0.005 per post read that is about $120–165 a month.
    Every run prints the exact count in the Actions log ("x ok … posts read") and the digest carries it as
    `x_reads_last_run`. To spend less, delete accounts from `sources.json → x.accounts`, lower
    `search_max_results`, or set `search_hours_utc` to a single hour.
@@ -142,17 +142,34 @@ and the Notes card lists what each source returned.
 Edit `sources.json` in the repository (pencil icon → commit). Seed X accounts carry a starting tier and
 `always: true` for accounts whose every post should reach the digest; the dashboard keeps the authoritative tier
 and the measured hit rate. Add subreddits, feeds, watched pages, repos or market search terms the same way.
-The offline tests run at the start of every workflow run, so a malformed `sources.json` fails fast.
+The offline tests run at the start of every workflow run as an advisory step (a failure shows as a warning and does not
+stop collection); a malformed `sources.json` still fails the **Collect** step before anything is committed.
 
 ## If something goes wrong
 
+- **"Process completed with exit code 1"** → that line only says a step failed. Open the run, click **collect**, and
+  look for the step with the red ✗; its last lines name the cause.
+- **Commit data shows `! [rejected] main -> main (fetch first)`** → the run started from an older commit than the tip of
+  `main`. This is almost always **Re-run jobs**, which reuses the original run's commit, workflow file and code (so it
+  also ignores anything you uploaded since). Start a new run with **Run workflow** instead. The step now rebases onto
+  `main` before pushing, so an upload made while a run is collecting no longer breaks it, and a run that started from
+  stale data fails rather than overwrite newer data. Upload `collect.py`, `test_collect.py` and `sources.json` together,
+  since the tests and the collector change as a pair.
 - **Commit data step fails ("permission denied" / "refusing to allow a GitHub App")** → step 2 was skipped.
 - **x error 402/403** → the plan or payment method is not active, or the secret is a user token rather than the
   app-only Bearer Token. **429** → rate-limited; the script backs off, and the next run continues from `since_id`.
 - **reddit skipped** → expected without approved credentials (step 4). **reddit error 401** → client ID/secret
   wrong; **403** → user agent not in Reddit's format, or Reddit has revoked access under the 2026 changes.
 - **bluesky error 401** → add the two BSKY secrets (step 5).
-- **feeds "failed: …"** → one feed URL changed; the others still load. Fix or remove it in `sources.json`.
+- **feeds "failed: …"** → one feed URL changed or blocks datacenter IPs; the others still load. Fix or remove it in
+  `sources.json`, or give it a `fallbacks` list of mirror URLs.
+- **registry / sitemaps / careers / statuspage show error** → the endpoint changed shape or blocked the runner; the
+  other tripwires still run. They keep their baseline in `signals_raw.json`, so a one-off failure does not re-report
+  everything. Delete the matching key from `state` (or run with `--no-tripwires`) to reset or skip them.
+- **The dashboard task says the digest was truncated** → the file's last key must be `"complete": true`. If it is not,
+  lower `digest_budget_chars` in `sources.json` (default 56,000 characters, about 18K tokens). A fetch tool that saves
+  a file this size to disk instead of showing it inline is normal; the task reads the saved file in chunks, and only a
+  missing `complete` marker in the full text means truncation.
 - **The schedule stops after a quiet period** → GitHub disables scheduled workflows after 60 days without
   repository activity; the workflow's own commits normally prevent this. Re-enable from the Actions tab.
 - **The dashboard task cannot fetch the raw URL** → run `python3 collect.py --create-gist` once locally with
